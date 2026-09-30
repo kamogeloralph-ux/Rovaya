@@ -3,6 +3,8 @@
     {
       "allowed": {
         "origins": [
+          "https://rovaya.co.za",
+          "https://www.rovaya.co.za",
           "https://rovaya.pages.dev",
           "https://0b965bc7.rovaya.pages.dev"
         ],
