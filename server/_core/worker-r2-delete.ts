@@ -18,6 +18,10 @@ function corsHeaders(request: Request): Record<string, string> {
   };
 }
 
+function json(request: Request, body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: corsHeaders(request) });
+}
+
 function bearer(request: Request): string | null {
   const value = request.headers.get("authorization") ?? "";
   return value.startsWith("Bearer ") ? value.slice(7) : null;
