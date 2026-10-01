@@ -81,6 +81,12 @@ type ReportRow = {
   employee_number: string | null;
   opening_kilometers: number | null;
   shift: "morning" | "day" | "night" | null;
+  location: {
+    latitude: number;
+    longitude: number;
+    accuracy: number | null;
+    captured_at: string | null;
+  } | null;
   truck: {
     fleet_number: string;
     registration: string;
@@ -683,6 +689,10 @@ function AdminWorkspace() {
       "Inspection date",
       "Shift",
       "Opening kilometers",
+      "Inspection latitude",
+      "Inspection longitude",
+      "Location accuracy (m)",
+      "Location captured at",
       "Driver name",
       "Employee number",
       "Status",
@@ -701,6 +711,10 @@ function AdminWorkspace() {
         row.opening_kilometers != null
           ? `Opening Kilometers: ${row.opening_kilometers}`
           : "Opening Kilometers: —",
+        row.location?.latitude ?? "",
+        row.location?.longitude ?? "",
+        row.location?.accuracy ?? "",
+        row.location?.captured_at || "",
         row.driver_name || "",
         row.employee_number || "",
         row.status.replaceAll("_", " "),
@@ -797,6 +811,10 @@ function AdminWorkspace() {
         (pdf.splitTextToSize(value || "—", width).at(0) as
           | string
           | undefined) || "—";
+      const locationText = (row: ReportRow) =>
+        row.location
+          ? `GPS: ${row.location.latitude.toFixed(5)}, ${row.location.longitude.toFixed(5)}${row.location.accuracy != null ? ` ±${Math.round(row.location.accuracy)}m` : ""}`
+          : "Location: Not captured";
       const logoImg = await loadLogoImage();
 
       pdf.setFillColor(...green);
@@ -925,7 +943,9 @@ function AdminWorkspace() {
           x + 2.5,
           y + 12.4
         );
-        let lineY = y + 16.3;
+        pdf.setTextColor(...(row.location ? passGreen : muted));
+        pdf.text(locationText(row), x + 2.5, y + 15.1);
+        let lineY = y + 18.3;
         checklistCategories.forEach(category => {
           const categoryAnswers = answers.filter(
             answer =>
@@ -1764,6 +1784,27 @@ function AdminWorkspace() {
                             {row.opening_kilometers != null
                               ? row.opening_kilometers
                               : "—"}
+                          </span>
+                          <span className="col-span-2 sm:col-span-1">
+                            <span className="font-bold text-[#2e4335]">
+                              Location:
+                            </span>{" "}
+                            {row.location ? (
+                              <a
+                                className="text-[#2f5b3f] underline"
+                                href={`https://www.google.com/maps?q=${row.location.latitude},${row.location.longitude}`}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                {row.location.latitude.toFixed(5)},{" "}
+                                {row.location.longitude.toFixed(5)}
+                                {row.location.accuracy != null
+                                  ? ` (±${Math.round(row.location.accuracy)} m)`
+                                  : ""}
+                              </a>
+                            ) : (
+                              "Not captured"
+                            )}
                           </span>
                           <span>
                             <span className="font-bold text-[#2e4335]">

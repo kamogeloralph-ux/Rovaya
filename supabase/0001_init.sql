@@ -81,11 +81,16 @@ CREATE TABLE IF NOT EXISTS daily_inspections (
   employee_number TEXT,
   opening_kilometers INTEGER CHECK (opening_kilometers IS NULL OR opening_kilometers >= 0),
   shift TEXT CHECK (shift IS NULL OR lower(shift) IN ('morning','day','night')),
+  location_latitude REAL,
+  location_longitude REAL,
+  location_accuracy REAL,
+  location_captured_at TEXT,
   company_access_code TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_insp_company_date ON daily_inspections(company_id, inspection_date);
 CREATE INDEX IF NOT EXISTS idx_insp_truck ON daily_inspections(truck_id);
+CREATE INDEX IF NOT EXISTS idx_insp_location ON daily_inspections(location_latitude, location_longitude);
 CREATE TABLE IF NOT EXISTS inspection_answers (
   id TEXT PRIMARY KEY,
   inspection_id TEXT NOT NULL REFERENCES daily_inspections(id) ON DELETE CASCADE,
