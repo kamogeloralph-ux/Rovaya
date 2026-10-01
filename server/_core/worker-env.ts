@@ -1,4 +1,4 @@
-import type { KVNamespace, R2Bucket } from "@cloudflare/workers-types";
+import type { D1Database, KVNamespace, R2Bucket } from "@cloudflare/workers-types";
 
 /**
  * Cloudflare Worker environment bindings.
@@ -14,11 +14,14 @@ import type { KVNamespace, R2Bucket } from "@cloudflare/workers-types";
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_ANON_KEY: string;
-  SUPABASE_SERVICE_ROLE_KEY: string;
+  /** Optional. Only needed if the Supabase project still signs tokens with the legacy HS256 secret. */
+  SUPABASE_JWT_SECRET?: string;
   DATABASE_URL: string;
   JWT_SECRET: string;
   OAUTH_SERVER_URL: string;
   OWNER_OPEN_ID: string;
+  /** Cloudflare D1: the system of record for all fleet data (no Supabase data reads or writes). */
+  DB: D1Database;
   R2_BUCKET: R2Bucket;
   KV_CACHE: KVNamespace;
   ENVIRONMENT: "production" | "development";
