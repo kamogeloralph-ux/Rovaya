@@ -7,8 +7,12 @@ import {
 
 vi.mock("./supabase", () => ({
   supabase: null,
-  driverSupabase: null,
-  uploadInspectionPhoto: vi.fn(),
+  getStoredCompany: () => null,
+}));
+
+vi.mock("./api", () => ({
+  api: vi.fn(),
+  uploadDriverPhoto: vi.fn(),
 }));
 
 describe("inspection-sync", () => {
@@ -51,7 +55,8 @@ describe("inspection-sync", () => {
     expect(draft.checks).toEqual({ lights: true, brakes: false });
   });
 
-  it("queues an inspection when Supabase is unavailable", async () => {
+  it("queues an inspection when the device is offline", async () => {
+    vi.stubGlobal("navigator", { onLine: false });
     const result = await submitInspection({
       profile: { id: "driver-1", full_name: "Driver One" },
       selectedFleet: "7100796",
@@ -62,5 +67,6 @@ describe("inspection-sync", () => {
     });
 
     expect(result).toEqual({ queued: true });
+    vi.unstubAllGlobals();
   });
 });

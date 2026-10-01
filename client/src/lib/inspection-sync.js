@@ -1,4 +1,5 @@
-import { driverSupabase, getStoredCompany, uploadInspectionPhotoToR2 } from "./supabase";
+import { getStoredCompany } from "./supabase";
+import { api, uploadDriverPhoto } from "./api";
 
 const DRAFT_STORE = "field-ledger-inspection-drafts";
 const DRAFT_KEY = "current";
@@ -42,60 +43,30 @@ export async function clearInspectionDraft() { const db = await openDraftDb().ca
 export function flattenChecklistItems(sections) { return sections.flatMap((section) => section.items); }
 function readableError(error) { if (error instanceof Error) return error.message; if (error && typeof error === "object") { const message = error.message || error.details || error.hint; if (message) return String(message); } return "Unable to submit this inspection."; }
 function retryableError(error) { if (typeof navigator !== "undefined" && !navigator.onLine) return true; const status = Number(error?.status || error?.statusCode || 0); if ([408, 429].includes(status) || status >= 500) return true; return error instanceof TypeError || /fetch|network|failed to fetch|timeout|temporar/i.test(readableError(error)); }
-export function buildInspectionDraft({ step, fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued = false, syncStatus = null, syncAttempts = 0, lastSyncError = null, companyId = null, companyCode = null }) { return { companyId, companyCode, step, fullName, employeeNumber, selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued, syncStatus: syncStatus || (queued ? SYNC_STATES.savedOnDevice : SYNC_STATES.draft), syncAttempts, lastSyncError, savedAt: new Date().toISOString() }; }
+export function buildInspectionDraft({ inspectionId = null, step, fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued = false, syncStatus = null, syncAttempts = 0, lastSyncError = null, companyId = null, companyCode = null }) { return { inspectionId, companyId, companyCode, step, fullName, employeeNumber, selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued, syncStatus: syncStatus || (queued ? SYNC_STATES.savedOnDevice : SYNC_STATES.draft), syncAttempts, lastSyncError, savedAt: new Date().toISOString() }; }
 export async function getInspectionSyncState() { const draft = await loadInspectionDraft(); const meta = readSyncMeta(); return { state: draft?.syncStatus || meta.state || SYNC_STATES.draft, pending: Boolean(draft?.queued), attempts: draft?.syncAttempts || 0, lastError: draft?.lastSyncError || meta.lastError || null, lastSyncAt: meta.lastSyncAt || null }; }
 async function updateQueuedDraft(patch) { const draft = await loadInspectionDraft(); if (!draft?.queued) return; await saveInspectionDraft({ ...draft, ...patch, savedAt: new Date().toISOString() }); }
 
-async function submitOnline({ fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, companyId, companyCode }) {
-  if (!driverSupabase) throw new Error("Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.");
+async function submitOnline({ inspectionId: existingId, fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, companyId, companyCode }) {
   if (!fullName?.trim()) throw new Error("Full names and surnames are required.");
   if (!companyId || !companyCode) throw new Error("No company selected. Please enter your company access code again.");
-  const { data: truck, error: truckError } = await driverSupabase.from("trucks").select("id, fleet_number").eq("fleet_number", selectedFleet).eq("company_id", companyId).maybeSingle();
-  if (truckError) throw truckError;
-  if (!truck) throw new Error("The selected fleet number was not found for this company.");
-  const { data: template, error: templateError } = await driverSupabase.from("checklist_templates").select("id, version").eq("company_id", companyId).eq("active", true).order("version", { ascending: false }).limit(1).maybeSingle();
-  if (templateError) throw templateError;
-  if (!template) throw new Error("No active checklist template exists for this company.");
-  const { data: dbItems, error: itemError } = await driverSupabase.from("checklist_items").select("id, sort_order, prompt").eq("template_id", template.id).order("sort_order");
-  if (itemError) throw itemError;
-  if (!dbItems || dbItems.length === 0) throw new Error("This company's checklist has no items configured.");
-  if (dbItems.some((item) => checks[item.id] === undefined)) throw new Error("The checklist has changed since you started. Please refresh and try again.");
   if (!(selfieFile instanceof File) || selfieFile.size === 0) throw new Error("The selfie image is missing. Please capture the selfie again.");
-  const inspectionDate = new Date().toISOString().slice(0, 10);
-  const inspectionId = crypto.randomUUID();
-  // Upload every photo BEFORE writing anything to the database. Previously the
-  // daily_inspections row was inserted (status: "completed") first and photos were
-  // uploaded afterward — so a failed or interrupted upload left a permanent
-  // "completed" inspection record with missing evidence, since there was nothing to
-  // roll it back. Uploading first means a failure here throws before any row exists,
-  // so a retry (via the offline queue) starts clean instead of producing a duplicate,
-  // partially-evidenced record. The remaining, much smaller risk — an upload
-  // succeeding but a later DB write failing — only leaves unreferenced files in R2,
-  // which is far safer than a false "completed" compliance record.
-  const uploadedPhotos = [];
-  const selfieUpload = await uploadInspectionPhotoToR2(selfieFile, inspectionId, "selfie", driverSupabase);
-  if (selfieUpload.error) throw selfieUpload.error;
-  uploadedPhotos.push({ inspection_id: inspectionId, photo_type: "selfie", storage_path: selfieUpload.data.storagePath, storage_provider: "r2", captured_at: new Date().toISOString() });
+  // The inspection id is created once per draft and reused on every retry. The Worker's upload and submit
+  // endpoints are both idempotent on it, so an interrupted attempt can never produce a duplicate record
+  // or a second copy of the same photo.
+  const inspectionId = existingId || crypto.randomUUID();
+  // Upload every photo BEFORE submitting the inspection. A failed or interrupted upload throws here, before
+  // any record exists, so a retry starts clean instead of leaving a "completed" inspection with missing evidence.
+  const photos = [];
+  const selfie = await uploadDriverPhoto(selfieFile, inspectionId, "selfie", companyCode);
+  photos.push({ photoType: "selfie", objectKey: selfie.objectKey });
   for (const [photoType, file] of Object.entries(photoFiles ?? {})) {
-    const upload = await uploadInspectionPhotoToR2(file, inspectionId, photoType, driverSupabase);
-    if (upload.error) throw upload.error;
-    uploadedPhotos.push({ inspection_id: inspectionId, photo_type: photoType, storage_path: upload.data.storagePath, storage_provider: "r2", captured_at: new Date().toISOString() });
+    const upload = await uploadDriverPhoto(file, inspectionId, photoType, companyCode);
+    photos.push({ photoType, objectKey: upload.objectKey });
   }
-  const payload = { id: inspectionId, driver_id: null, driver_name: fullName.trim(), employee_number: employeeNumber?.trim() || null, truck_id: truck.id, opening_kilometers: openingKilometers === "" || openingKilometers == null ? null : Number(openingKilometers), shift, checklist_template_id: template.id, inspection_date: inspectionDate, started_at: new Date().toISOString(), submitted_at: new Date().toISOString(), status: "completed", notes: notes?.trim() || null, signature_name: fullName.trim(), company_id: companyId, company_access_code: companyCode };
-  const { error: inspectionError } = await driverSupabase.from("daily_inspections").insert(payload);
-  if (inspectionError) throw inspectionError;
-  const answers = dbItems.map((item) => ({ inspection_id: inspectionId, checklist_item_id: item.id, result: checks[item.id] ? "pass" : "fail" }));
-  const { error: answerError } = await driverSupabase.from("inspection_answers").insert(answers);
-  if (answerError) throw answerError;
-  const failedItems = dbItems.filter((item) => !checks[item.id]);
-  if (failedItems.length > 0) {
-    const defectRows = failedItems.map((item) => ({ inspection_id: inspectionId, category: "checklist", severity: "medium", title: item.prompt || "Failed checklist item", description: itemNotes?.[item.id]?.trim() || null, status: "open", reported_by: null }));
-    const { error: defectError } = await driverSupabase.from("defects").insert(defectRows);
-    if (defectError) throw defectError;
-  }
-  const { error: photosError } = await driverSupabase.from("inspection_photos").insert(uploadedPhotos);
-  if (photosError) throw photosError;
+  // One request writes the inspection, answers, defects and photo records atomically (Cloudflare D1).
+  await api("/driver/inspections", { method: "POST", body: { inspectionId, code: companyCode, fullName: fullName.trim(), employeeNumber: employeeNumber?.trim() || "", fleetNumber: selectedFleet, openingKilometers: openingKilometers === "" || openingKilometers == null ? null : Number(openingKilometers), shift, checks, itemNotes, notes: notes?.trim() || "", photos } });
   return { queued: false, inspectionId };
 }
-export async function submitInspection({ allowQueue = true, ...draft }) { const queuedDraft = buildInspectionDraft({ ...draft, queued: true, syncStatus: SYNC_STATES.savedOnDevice }); const offline = !driverSupabase || (typeof navigator !== "undefined" && !navigator.onLine); if (offline) { if (!allowQueue) throw new Error("The connection is still offline."); await saveInspectionDraft(queuedDraft); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: "Waiting for an internet connection." }); return { queued: true }; } try { writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); const result = await submitOnline(draft); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return result; } catch (error) { if (allowQueue && retryableError(error)) { const attempts = (draft.syncAttempts || 0) + 1; await saveInspectionDraft({ ...queuedDraft, syncAttempts: attempts, lastSyncError: readableError(error) }); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: readableError(error) }); return { queued: true }; } throw new Error(readableError(error)); } }
-export async function syncQueuedInspection({ checklistSections }) { if (!driverSupabase || (typeof navigator !== "undefined" && !navigator.onLine)) return null; const draft = await loadInspectionDraft(); if (!draft?.queued) return null; const attempts = (draft.syncAttempts || 0) + 1; await updateQueuedDraft({ syncStatus: SYNC_STATES.uploading, syncAttempts: attempts, lastSyncError: null }); writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); try { await updateQueuedDraft({ syncStatus: SYNC_STATES.syncing }); writeSyncMeta({ state: SYNC_STATES.syncing, pending: true }); const storedCompany = getStoredCompany(); const result = await submitOnline({ ...draft, companyId: storedCompany?.companyId || draft.companyId, companyCode: storedCompany?.code || draft.companyCode, checklistSections }); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return { ...result, syncStatus: SYNC_STATES.submitted }; } catch (error) { const message = readableError(error); await updateQueuedDraft({ syncStatus: SYNC_STATES.failed, lastSyncError: message }); writeSyncMeta({ state: SYNC_STATES.failed, pending: true, lastError: message }); throw new Error(message); } }
+export async function submitInspection({ allowQueue = true, ...input }) { const draft = { ...input, inspectionId: input.inspectionId || crypto.randomUUID() }; const queuedDraft = buildInspectionDraft({ ...draft, queued: true, syncStatus: SYNC_STATES.savedOnDevice }); const offline = typeof navigator !== "undefined" && !navigator.onLine; if (offline) { if (!allowQueue) throw new Error("The connection is still offline."); await saveInspectionDraft(queuedDraft); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: "Waiting for an internet connection." }); return { queued: true }; } try { writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); const result = await submitOnline(draft); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return result; } catch (error) { if (allowQueue && retryableError(error)) { const attempts = (draft.syncAttempts || 0) + 1; await saveInspectionDraft({ ...queuedDraft, syncAttempts: attempts, lastSyncError: readableError(error) }); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: readableError(error) }); return { queued: true }; } throw new Error(readableError(error)); } }
+export async function syncQueuedInspection({ checklistSections }) { if (typeof navigator !== "undefined" && !navigator.onLine) return null; const draft = await loadInspectionDraft(); if (!draft?.queued) return null; const attempts = (draft.syncAttempts || 0) + 1; await updateQueuedDraft({ syncStatus: SYNC_STATES.uploading, syncAttempts: attempts, lastSyncError: null }); writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); try { await updateQueuedDraft({ syncStatus: SYNC_STATES.syncing }); writeSyncMeta({ state: SYNC_STATES.syncing, pending: true }); const storedCompany = getStoredCompany(); const result = await submitOnline({ ...draft, companyId: storedCompany?.companyId || draft.companyId, companyCode: storedCompany?.code || draft.companyCode, checklistSections }); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return { ...result, syncStatus: SYNC_STATES.submitted }; } catch (error) { const message = readableError(error); await updateQueuedDraft({ syncStatus: SYNC_STATES.failed, lastSyncError: message }); writeSyncMeta({ state: SYNC_STATES.failed, pending: true, lastError: message }); throw new Error(message); } }
