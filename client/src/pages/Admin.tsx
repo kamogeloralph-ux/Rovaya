@@ -122,7 +122,11 @@ function AdminWorkspace() {
     try { setAuditEvents(await adminApi.get<AuditEvent[]>(`audit?companyId=${encodeURIComponent(selectedCompanyId)}`)); } catch (error) { toastError(errMsg(error, "Unable to load the audit trail.")); }
   };
   useEffect(() => { void loadCompanies(); }, []);
-  useEffect(() => { void load(); void loadDefects(); void loadAuditEvents(); }, [reportDate, selectedCompanyId]);
+  useEffect(() => {
+    void load(); void loadDefects(); void loadAuditEvents();
+    const refresh = window.setInterval(() => void load(), 20_000);
+    return () => window.clearInterval(refresh);
+  }, [reportDate, selectedCompanyId]);
 
   const createCompany = async (event: React.FormEvent) => {
     event.preventDefault();

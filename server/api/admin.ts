@@ -166,7 +166,7 @@ export async function handleAdmin({ request, env, url }: ApiContext, segments: s
        FROM daily_inspections i LEFT JOIN trucks t ON t.id = i.truck_id
        WHERE i.company_id = ? AND i.inspection_date = ? ORDER BY i.created_at DESC`
     ).bind(companyId, date).all<Record<string, any>>()).results;
-    if (inspections.length === 0) return json(request, [], 200, { "cache-control": "private, max-age=20" });
+    if (inspections.length === 0) return json(request, [], 200, { "cache-control": "no-store" });
     const ids = inspections.map((r) => r.id);
     const [answers, photos] = await Promise.all([
       env.DB.prepare(
@@ -186,7 +186,7 @@ export async function handleAdmin({ request, env, url }: ApiContext, segments: s
       })),
       photos: signedPhotos.filter((p) => p.inspection_id === r.id).map(({ inspection_id: _omit, ...p }) => p),
     }));
-    return json(request, rows, 200, { "cache-control": "private, max-age=20" });
+    return json(request, rows, 200, { "cache-control": "no-store" });
   }
 
   // ---- defects ----------------------------------------------------------------

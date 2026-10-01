@@ -17,7 +17,7 @@ export class ApiError extends Error {
   }
 }
 
-type Options = { method?: string; body?: unknown; auth?: boolean; raw?: { body: Blob | File; contentType: string } };
+type Options = { method?: string; body?: unknown; auth?: boolean; cache?: RequestCache; raw?: { body: Blob | File; contentType: string } };
 
 async function accessToken(): Promise<string> {
   if (!supabase) throw new ApiError("Sign-in is not configured.", 401);
@@ -32,14 +32,14 @@ export async function api<T = unknown>(path: string, options: Options = {}): Pro
   let body: BodyInit | undefined;
   if (options.raw) { headers["content-type"] = options.raw.contentType; body = options.raw.body; }
   else if (options.body !== undefined) { headers["content-type"] = "application/json"; body = JSON.stringify(options.body); }
-  const response = await fetch(`${API_BASE}${path}`, { method: options.method ?? "GET", headers, body }); // network failure -> TypeError (retryable)
+  const response = await fetch(`${API_BASE}${path}`, { method: options.method ?? "GET", headers, body, cache: options.cache }); // network failure -> TypeError (retryable)
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new ApiError((payload as { error?: string }).error || `Request failed (${response.status}).`, response.status, Boolean((payload as { retryable?: boolean }).retryable));
   return payload as T;
 }
 
 export const adminApi = {
-  get: <T = unknown>(path: string) => api<T>(`/admin/${path}`, { auth: true }),
+  get: <T = unknown>(path: string) => api<T>(`/admin/${path}`, { auth: true, cache: "no-store" }),
   post: <T = unknown>(path: string, body: unknown) => api<T>(`/admin/${path}`, { method: "POST", body, auth: true }),
   patch: <T = unknown>(path: string, body: unknown) => api<T>(`/admin/${path}`, { method: "PATCH", body, auth: true }),
   delete: <T = unknown>(path: string) => api<T>(`/admin/${path}`, { method: "DELETE", auth: true }),
