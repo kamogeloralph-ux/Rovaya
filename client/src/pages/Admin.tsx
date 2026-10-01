@@ -101,7 +101,10 @@ function AdminWorkspace() {
     if (failed) toastError(errMsg(failed.reason, "Unable to load admin data."));
     setTrucks(truckResult.status === "fulfilled" ? truckResult.value : []); setAdmins(adminResult.status === "fulfilled" ? adminResult.value : []);
     // Photo links arrive already signed by the Worker, so evidence sets stay grouped per inspection with no extra requests.
-    setReports(reportResult.status === "fulfilled" ? reportResult.value : []); setExpandedReportIds(new Set()); setLoading(false);
+    const nextReports = reportResult.status === "fulfilled" ? reportResult.value : [];
+    setReports(nextReports);
+    setExpandedReportIds((current) => { const validIds = new Set(nextReports.map((row) => row.id)); return new Set(Array.from(current).filter((id) => validIds.has(id))); });
+    setLoading(false);
   };
   const logAudit = async (entityType: string, entityId: string, action: string, metadata: Record<string, unknown> = {}) => {
     if (!profile?.id || !selectedCompanyId) return;
@@ -203,160 +206,98 @@ function AdminWorkspace() {
       const pdf = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape" });
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
-      const marginX = 10;
-      const bottomLimit = pageHeight - 12;
-
-      // Column layout. Checklist items are grouped into their categories (Exterior, Interior,
-      // Suspension & mechanical, Safety equipment, Load & security) — one column per category,
-      // showing green only if every item in that category passed. The key beneath the table
-      // lists which prompts belong to each category, the same way the wash-bay report keys its
-      // short columns.
-      const firstAnswers = sortedAnswers(filteredReports[0]?.answers ?? []);
-      const categoryOrder = Array.from(new Set(firstAnswers.map((a) => a.checklist_item?.section_title || "Checklist")));
-      const categoryResult = (answers: typeof firstAnswers, category: string) => {
-        const items = answers.filter((a) => (a.checklist_item?.section_title || "Checklist") === category);
-        if (items.length === 0) return null;
-        return items.every((a) => a.result === "pass");
-      };
-      const checklistCols = categoryOrder;
-      const checklistCount = categoryOrder.length;
-      const fixedCols = [
-        { key: "#", w: 7 },
-        { key: "Fleet No.", w: 18 },
-        { key: "Registration", w: 19 },
-        { key: "Driver", w: 24 },
-        { key: "Employee #", w: 16 },
-        { key: "Shift", w: 12 },
-        { key: "Open KM", w: 14 },
-      ];
-      const tailCols = [
-        { key: "Photos", w: 12 },
-        { key: "Notes", w: 0 }, // filled below with remaining space
-      ];
+      const marginX = 8;
       const usableWidth = pageWidth - marginX * 2;
-      const checklistColWidth = checklistCount > 0 ? 20 : 0;
-      const fixedWidth = fixedCols.reduce((sum, c) => sum + c.w, 0);
-      const checklistWidth = checklistColWidth * checklistCount;
-      const photosWidth = tailCols[0].w;
-      const minimumNotesWidth = 48;
-      tailCols[1].w = Math.max(minimumNotesWidth, usableWidth - fixedWidth - checklistWidth - photosWidth);
-      const columns = [...fixedCols, ...checklistCols.map((label) => ({ key: label, w: checklistColWidth })), ...tailCols];
-
-      const headerHeight = 12;
-      let y = 0;
-
+      const bottomLimit = pageHeight - 10;
+      const green: [number, number, number] = [47, 70, 56];
+      const ink: [number, number, number] = [20, 30, 25];
+      const muted: [number, number, number] = [90, 100, 90];
+      const pale: [number, number, number] = [245, 242, 234];
+      const categoryOrder = Array.from(new Set(filteredReports.flatMap((row) => sortedAnswers(row.answers ?? []).map((answer) => answer.checklist_item?.section_title || "Checklist"))));
+      const categoryCodes = new Map(categoryOrder.map((category, index) => [category, `C${index + 1}`]));
+      const categoryResult = (answers: ReportRow["answers"], category: string) => {
+        const items = answers.filter((answer) => (answer.checklist_item?.section_title || "Checklist") === category);
+        if (items.length === 0) return null;
+        return { passed: items.every((answer) => answer.result === "pass"), total: items.length, failed: items.filter((answer) => answer.result !== "pass").length };
+      };
+      const summaryFixed = [
+        { key: "#", w: 7 }, { key: "Fleet", w: 22 }, { key: "Reg", w: 25 }, { key: "Driver", w: 35 },
+        { key: "Shift", w: 14 }, { key: "Open KM", w: 18 }, { key: "Checks", w: 21 }, { key: "Photos", w: 20 }, { key: "Issues", w: 19 },
+      ];
+      const categoryWidth = categoryOrder.length > 5 ? 12 : 14;
+      const notesColumn = { key: "Notes", w: Math.max(30, usableWidth - summaryFixed.reduce((sum, column) => sum + column.w, 0) - categoryOrder.length * categoryWidth) };
+      const columns = [...summaryFixed, ...categoryOrder.map((category) => ({ key: categoryCodes.get(category) || "C", w: categoryWidth })), notesColumn];
+      const ellipsis = (value: string, width: number) => pdf.splitTextToSize(value || "—", width - 2)[0] || "—";
       const shiftShort = (shift: ReportRow["shift"]) => (shift === "morning" ? "AM" : shift === "day" ? "Day" : shift === "night" ? "Night" : "—");
-
-      const drawTableHeader = () => {
-        pdf.setFillColor(47, 70, 56);
-        pdf.rect(marginX, y, usableWidth, headerHeight, "F");
-        pdf.setFont("helvetica", "bold"); pdf.setFontSize(7.5); pdf.setTextColor(255, 255, 255);
+      let y = 0;
+      const drawSummaryHeader = () => {
+        const headerHeight = 8;
+        pdf.setFillColor(...green); pdf.rect(marginX, y, usableWidth, headerHeight, "F");
+        pdf.setFont("helvetica", "bold"); pdf.setFontSize(6.5); pdf.setTextColor(255, 255, 255);
         let x = marginX;
-        columns.forEach((col) => {
-          const isCategoryCol = checklistCols.includes(col.key);
-          const lines = pdf.splitTextToSize(col.key, col.w - 2).slice(0, 2);
-          const startY = lines.length > 1 ? y + headerHeight / 2 - 1.5 : y + headerHeight - 4;
-          if (isCategoryCol) lines.forEach((line: string, i: number) => pdf.text(line, x + col.w / 2, startY + i * 3.6, { align: "center" }));
-          else lines.forEach((line: string, i: number) => pdf.text(line, x + 1.5, startY + i * 3.6));
-          x += col.w;
-        });
-        pdf.setTextColor(20, 30, 25);
-        y += headerHeight;
+        columns.forEach((column) => { pdf.text(column.key, x + column.w / 2, y + 5.2, { align: "center" }); x += column.w; });
+        y += headerHeight; pdf.setTextColor(...ink);
       };
-
-      const ensureSpace = (needed: number) => {
-        if (y + needed > bottomLimit) { pdf.addPage(); y = 20; drawTableHeader(); }
+      const drawTitle = (title: string, subtitle: string) => {
+        pdf.setFont("helvetica", "bold"); pdf.setFontSize(14); pdf.setTextColor(...ink); pdf.text(title, marginX, 12);
+        pdf.setFont("helvetica", "normal"); pdf.setFontSize(7.5); pdf.setTextColor(...muted); pdf.text(subtitle, marginX, 17);
+        pdf.setTextColor(...ink);
       };
+      const ensureSummarySpace = (needed: number) => { if (y + needed > bottomLimit) { pdf.addPage(); y = 8; drawTitle(`${companyName} — Inspection Summary`, `${reportDate} · summary continues`); y = 22; drawSummaryHeader(); } };
+      const drawCell = (text: string, width: number, x: number, rowY: number, rowHeight: number, bold = false) => { pdf.setFont("helvetica", bold ? "bold" : "normal"); pdf.setFontSize(6.6); pdf.setTextColor(...ink); pdf.text(ellipsis(text, width), x + width / 2, rowY + rowHeight / 2 + 2.1, { align: "center" }); };
 
-      // Cover header: centered Rovaya wordmark with the report title directly beneath it.
       const logoImg = await loadLogoImage();
       if (logoImg) {
-        const logoH = 16;
-        const logoW = logoImg.naturalWidth && logoImg.naturalHeight ? logoH * (logoImg.naturalWidth / logoImg.naturalHeight) : 52;
-        pdf.addImage(logoImg, "PNG", (pageWidth - logoW) / 2, 5, logoW, logoH);
+        const logoH = 9;
+        const logoW = logoImg.naturalWidth && logoImg.naturalHeight ? logoH * (logoImg.naturalWidth / logoImg.naturalHeight) : 30;
+        pdf.addImage(logoImg, "PNG", pageWidth - marginX - logoW, 5, logoW, logoH);
       }
-      pdf.setFont("helvetica", "bold"); pdf.setFontSize(17); pdf.setTextColor(20, 30, 25);
-      pdf.text("Clover Inspection Report", pageWidth / 2, 28, { align: "center" });
-      pdf.setFont("helvetica", "normal"); pdf.setFontSize(10); pdf.setTextColor(47, 70, 56);
-      pdf.text(`${companyName} · Fleet Manager`, pageWidth / 2, 34, { align: "center" });
-      pdf.setFontSize(8); pdf.setTextColor(90, 100, 90);
-      pdf.text(`Report date: ${reportDate}    Fleets inspected: ${filteredReports.length}    Generated: ${new Date().toLocaleString()}`, pageWidth / 2, 40, { align: "center" });
-      pdf.setTextColor(20, 30, 25);
-      y = 46;
-      drawTableHeader();
+      drawTitle(`${companyName} — Daily Fleet Inspection Summary`, `${reportDate} · ${filteredReports.length} fleet${filteredReports.length === 1 ? "" : "s"} inspected · Generated ${new Date().toLocaleString()}`);
+      pdf.setFont("helvetica", "normal"); pdf.setFontSize(6.5); pdf.setTextColor(...muted);
+      const legend = `Checks: pass/fail by category · Photos: vehicle photos + ID selfie · Issues: failed checklist items · ${categoryOrder.map((category) => `${categoryCodes.get(category)}=${category}`).join("   ")}`;
+      const legendLines = pdf.splitTextToSize(legend, usableWidth).slice(0, 2) as string[];
+      legendLines.forEach((line, index) => pdf.text(line, marginX, 22 + index * 3.2));
+      y = 28 + (legendLines.length - 1) * 3.2;
+      drawSummaryHeader();
 
       filteredReports.forEach((row, index) => {
-        const noteLines = pdf.splitTextToSize(row.notes || "—", tailCols[1].w - 3).slice(0, 3) as string[];
-        const rowHeight = Math.max(9, noteLines.length * 3.5 + 4);
-        ensureSpace(rowHeight);
         const answers = sortedAnswers(row.answers ?? []);
         const photos = sortedPhotos(row.photos ?? []);
-        if (index % 2 === 1) { pdf.setFillColor(245, 242, 234); pdf.rect(marginX, y, usableWidth, rowHeight, "F"); }
-
+        const failures = answers.filter((answer) => answer.result !== "pass");
+        const vehiclePhotoCount = photos.filter((photo) => photo.photo_type !== "selfie").length;
+        const rowHeight = 7.2;
+        ensureSummarySpace(rowHeight);
+        if (index % 2 === 1) { pdf.setFillColor(...pale); pdf.rect(marginX, y, usableWidth, rowHeight, "F"); }
         let x = marginX;
-        pdf.setFont("helvetica", "normal"); pdf.setFontSize(7.5); pdf.setTextColor(20, 30, 25);
-        const cell = (text: string, width: number, opts?: { bold?: boolean }) => {
-          pdf.setFont("helvetica", opts?.bold ? "bold" : "normal");
-          const clipped = pdf.splitTextToSize(text, width - 2)[0] ?? "";
-          pdf.text(clipped, x + 1.5, y + rowHeight - 2.5);
-          x += width;
-        };
-
-        cell(String(index + 1), fixedCols[0].w);
-        cell(formatFleetNumber(row.truck?.fleet_number || ""), fixedCols[1].w, { bold: true });
-        cell(row.truck?.registration || "—", fixedCols[2].w);
-        cell(row.driver_name || "Unknown", fixedCols[3].w);
-        cell(row.employee_number || "—", fixedCols[4].w);
-        cell(shiftShort(row.shift), fixedCols[5].w);
-        cell(row.opening_kilometers != null ? String(row.opening_kilometers) : "—", fixedCols[6].w);
-
-        categoryOrder.forEach((category) => {
-          const pass = categoryResult(answers, category);
-          const cx = x + checklistColWidth / 2;
-          pdf.setFont("helvetica", "bold");
-          if (pass === null) {
-            pdf.setTextColor(150, 145, 130);
-            pdf.text("—", cx, y + rowHeight - 2.5, { align: "center" });
-          } else {
-            pdf.setTextColor(pass ? 40 : 191, pass ? 120 : 74, pass ? 70 : 46);
-            pdf.text(pass ? "Y" : "N", cx, y + rowHeight - 2.5, { align: "center" });
-          }
-          pdf.setTextColor(20, 30, 25);
-          x += checklistColWidth;
-        });
-        cell(`${photos.length}/7`, tailCols[0].w);
-        pdf.setFont("helvetica", "normal");
-        noteLines.forEach((line, lineIndex) => pdf.text(line, x + 1.5, y + 4 + lineIndex * 3.5));
-        x += tailCols[1].w;
-
-        pdf.setDrawColor(225, 220, 205);
-        pdf.line(marginX, y + rowHeight, marginX + usableWidth, y + rowHeight);
-        y += rowHeight;
+        const values = [String(index + 1), formatFleetNumber(row.truck?.fleet_number || "—"), row.truck?.registration || "—", row.driver_name || "Unknown", shiftShort(row.shift), row.opening_kilometers != null ? String(row.opening_kilometers) : "—", `${answers.filter((answer) => answer.result === "pass").length}/${answers.length}`, `${vehiclePhotoCount}/6${photos.some((photo) => photo.photo_type === "selfie") ? " + ID" : ""}`, failures.length ? String(failures.length) : "—"];
+        summaryFixed.forEach((column, columnIndex) => { drawCell(values[columnIndex], column.w, x, y, rowHeight, column.key === "Fleet"); x += column.w; });
+        categoryOrder.forEach((category) => { const result = categoryResult(answers, category); pdf.setFont("helvetica", "bold"); pdf.setFontSize(7); pdf.setTextColor(result?.passed ? 40 : result ? 191 : 150, result?.passed ? 120 : result ? 74 : 145, result?.passed ? 70 : result ? 46 : 130); pdf.text(result ? (result.passed ? "✓" : "✕") : "—", x + categoryWidth / 2, y + rowHeight / 2 + 2.1, { align: "center" }); x += categoryWidth; });
+        drawCell(row.notes || "—", notesColumn.w, x, y, rowHeight);
+        pdf.setDrawColor(225, 220, 205); pdf.line(marginX, y + rowHeight, marginX + usableWidth, y + rowHeight); y += rowHeight;
       });
 
-      // Key: what each Qn column and Y/N mean, plus the full prompt text — same role as the
-      // wash-bay report's "PRE-WASH KEY" legend beneath its table.
-      ensureSpace(10 + firstAnswers.length * 4.5 + categoryOrder.length * 5);
-      y += 4;
-      pdf.setFont("helvetica", "bold"); pdf.setFontSize(9); pdf.text("Checklist key (Y = all items in category passed, N = one or more failed)", marginX, y); y += 5.5;
-      categoryOrder.forEach((category) => {
-        ensureSpace(9);
-        pdf.setFont("helvetica", "bold"); pdf.setFontSize(8); pdf.setTextColor(20, 30, 25);
-        pdf.text(category, marginX, y); y += 4.2;
-        pdf.setFont("helvetica", "normal"); pdf.setFontSize(7.5); pdf.setTextColor(90, 100, 90);
-        firstAnswers.filter((a) => (a.checklist_item?.section_title || "Checklist") === category).forEach((answer) => {
-          ensureSpace(4);
-          pdf.text(`•  ${answer.checklist_item?.prompt || "Checklist item"}`, marginX + 3, y);
-          y += 4;
+      const exceptions = filteredReports.filter((row) => sortedAnswers(row.answers ?? []).some((answer) => answer.result !== "pass") || Boolean(row.notes));
+      if (exceptions.length > 0) {
+        pdf.addPage(); y = 8; drawTitle(`${companyName} — Exceptions and Follow-up`, `${reportDate} · only fleets needing attention`); y = 24;
+        pdf.setFont("helvetica", "normal"); pdf.setFontSize(7); pdf.setTextColor(...muted); pdf.text("A fleet is listed here only when a checklist item failed or the driver added a note. All other fleets passed the recorded checks.", marginX, y); y += 6;
+        exceptions.forEach((row, index) => {
+          const answers = sortedAnswers(row.answers ?? []);
+          const failures = answers.filter((answer) => answer.result !== "pass");
+          const lines = failures.map((answer) => `${categoryCodes.get(answer.checklist_item?.section_title || "Checklist") || "C"}: ${answer.checklist_item?.prompt || "Failed checklist item"}`);
+          if (row.notes) lines.push(`Driver note: ${row.notes}`);
+          const blockHeight = 9 + lines.length * 4;
+          if (y + blockHeight > bottomLimit) { pdf.addPage(); y = 12; drawTitle(`${companyName} — Exceptions and Follow-up`, `${reportDate} · continued`); y = 24; }
+          if (index % 2 === 1) { pdf.setFillColor(...pale); pdf.rect(marginX, y - 2, usableWidth, blockHeight, "F"); }
+          pdf.setFont("helvetica", "bold"); pdf.setFontSize(8); pdf.setTextColor(...ink); pdf.text(`Fleet ${formatFleetNumber(row.truck?.fleet_number || "—")} · ${row.truck?.registration || "—"} · ${row.driver_name || "Unknown"}`, marginX + 2, y + 3);
+          pdf.setFont("helvetica", "normal"); pdf.setFontSize(7); pdf.setTextColor(...muted); pdf.text(`${shiftShort(row.shift)} · ${failures.length} failed item${failures.length === 1 ? "" : "s"}`, pageWidth - marginX - 2, y + 3, { align: "right" });
+          lines.forEach((line, lineIndex) => { pdf.setTextColor(...ink); pdf.text(`• ${ellipsis(line, usableWidth - 6)}`, marginX + 4, y + 8 + lineIndex * 4); });
+          y += blockHeight + 2;
         });
-        y += 1.5;
-      });
-      pdf.setTextColor(20, 30, 25);
-
+      }
       const blob = pdf.output("blob");
       const file = new File([blob], `${companyName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-fleet-inspection-report-${reportDate}.pdf`, { type: "application/pdf" });
       if (navigator.share && navigator.canShare?.({ files: [file] })) await navigator.share({ title: `${companyName} Fleet Inspection Report`, text: `${companyName} fleet inspection report for ${reportDate}`, files: [file] });
-      else { const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = file.name; link.click(); toastSuccess("Report PDF downloaded."); }
+      else { const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = file.name; link.click(); toastSuccess("Compact inspection report PDF downloaded."); }
     } catch (error) {
       toastError(error instanceof Error ? error.message : "Unable to generate the report PDF.");
     } finally {
