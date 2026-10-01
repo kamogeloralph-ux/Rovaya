@@ -3,7 +3,8 @@ import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { appRouter } from "../server/routers";
 import { createWorkerContext } from "../server/_core/worker-context";
 import { handleStorageProxy } from "../server/_core/worker-storage-proxy";
-import { handleR2PhotoDelete } from "../server/_core/worker-r2-delete";
+import { handleApi } from "../server/api/router";
+import { runRetention } from "../server/api/retention";
 import type { Env } from "../server/_core/worker-env";
 
 export type { Env };
@@ -15,6 +16,11 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const url = new URL(request.url);
+
+    // Rovaya REST API: D1 + R2, fronted by the Cloudflare edge cache. Supabase is only
+    // contacted for sign-in (token issue/refresh) - never for data.
+    const apiResponse = await handleApi(request, env, ctx);
+    if (apiResponse) return apiResponse;
 
     // Handle tRPC API requests
     if (url.pathname.startsWith("/api/trpc")) {
@@ -59,14 +65,12 @@ export default {
       return handleStorageProxy(request, env);
     }
 
-    // Admin-only R2 photo deletion. The endpoint validates the Supabase
-    // session and company scope before deleting both the R2 object and row.
-    if (url.pathname === "/api/r2/photo/delete") {
-      return handleR2PhotoDelete(request, env);
-    }
-
     // Default 404
     return new Response("Not Found", { status: 404 });
+  },
+  // Nightly cleanup (see [triggers] in wrangler.toml): expired photos + orphaned R2 uploads.
+  async scheduled(_event: unknown, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runRetention(env).then((result) => console.log("[retention]", JSON.stringify(result))));
   },
 // `satisfies ExportedHandler<Env>` would fail here: ExportedHandler's own
 // signature expects @cloudflare/workers-types' Request/Response, but this
