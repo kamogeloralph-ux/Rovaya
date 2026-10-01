@@ -461,12 +461,12 @@ export default function AdminPhotoLibrary({
                                 ? `· ${photo.driver_name}`
                                 : ""}
                             </div>
-                            <div className="mt-1 flex items-center gap-2">
+                            <div className="mt-2 grid grid-cols-2 gap-1.5 border-t border-[#e1dccf] pt-2">
                               <button
                                 type="button"
                                 disabled={sending || deleting}
                                 onClick={() => void sendToClient([photo])}
-                                className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-[0.06em] text-[#2f5b3f] hover:underline disabled:opacity-50"
+                                className="inline-flex h-7 min-w-0 items-center justify-center gap-1 rounded-md border border-[#bfd2c2] bg-[#f4faf3] px-1.5 text-[9px] font-bold uppercase tracking-[0.03em] text-[#2f5b3f] hover:bg-[#e8f3e7] disabled:cursor-not-allowed disabled:opacity-50"
                               >
                                 {sendingPhotoId === photo.id ? (
                                   <Loader2 className="h-3 w-3 animate-spin" />
@@ -479,7 +479,7 @@ export default function AdminPhotoLibrary({
                                 type="button"
                                 disabled={sending || deleting}
                                 onClick={() => void deletePhotos([photo])}
-                                className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-[0.06em] text-[#a44b2d] hover:underline disabled:opacity-50"
+                                className="inline-flex h-7 min-w-0 items-center justify-center gap-1 rounded-md border border-[#e7b9aa] bg-[#fff7f3] px-1.5 text-[9px] font-bold uppercase tracking-[0.03em] text-[#a44b2d] hover:bg-[#fff0ea] disabled:cursor-not-allowed disabled:opacity-50"
                               >
                                 <Trash2 className="h-3 w-3" /> Delete
                               </button>
