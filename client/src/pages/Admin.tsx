@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -344,6 +344,7 @@ function AdminWorkspace() {
   const [expandedReportIds, setExpandedReportIds] = useState<Set<string>>(
     new Set()
   );
+  const initialReportLoadRef = useRef(true);
   const toggleReportRow = (id: string) =>
     setExpandedReportIds(current => {
       const next = new Set(current);
@@ -374,7 +375,9 @@ function AdminWorkspace() {
       setLoading(false);
       return;
     }
-    setLoading(true);
+    // Keep the current report DOM mounted during background refreshes. Replacing it
+    // with a loading row every 20 seconds made an open inspection appear to close.
+    if (initialReportLoadRef.current) setLoading(true);
     const companyQuery = `companyId=${encodeURIComponent(selectedCompanyId)}`;
     const [truckResult, adminResult, reportResult] = await Promise.allSettled([
       adminApi.get<AdminTruck[]>(`trucks?${companyQuery}`),
@@ -389,16 +392,12 @@ function AdminWorkspace() {
     setAdmins(adminResult.status === "fulfilled" ? adminResult.value : []);
     // Photo links arrive already signed by the Worker, so evidence sets stay grouped per inspection with no extra requests.
     if (reportResult.status === "fulfilled") {
-      const nextReports = reportResult.value;
-      setReports(nextReports);
-      // A background refresh must never collapse an open inspection. Prune only rows
-      // that genuinely disappeared from a successful response; keep the current state
-      // intact when the report request fails transiently.
-      setExpandedReportIds(current => {
-        const validIds = new Set(nextReports.map(row => row.id));
-        return new Set(Array.from(current).filter(id => validIds.has(id)));
-      });
+      // Do not rewrite expandedReportIds here. The report list may refresh with
+      // signed-photo or cache changes, but the user's open/closed choices are UI
+      // state and must survive every background refresh.
+      setReports(reportResult.value);
     }
+    initialReportLoadRef.current = false;
     setLoading(false);
   };
   const logAudit = async (
@@ -463,6 +462,7 @@ function AdminWorkspace() {
     void loadCompanies();
   }, []);
   useEffect(() => {
+    initialReportLoadRef.current = true;
     void load();
     void loadDefects();
     void loadAuditEvents();
@@ -855,16 +855,16 @@ function AdminWorkspace() {
       pdf.setTextColor(...ink);
       pdf.text(
         `Date: ${pageDate}  |  Inspected: ${inspected}  |  Passed: ${passed}`,
-        pageWidth - marginX - 3,
-        marginX + 5.1,
+        pageWidth - marginX,
+        marginX + headerHeight + 4.2,
         { align: "right" }
       );
       pdf.setFont("helvetica", "bold");
       pdf.setTextColor(...red);
       pdf.text(
         `Issues: ${failed} FAIL${failed === 1 ? "" : "S"}`,
-        pageWidth - marginX - 3,
-        marginX + 10.7,
+        pageWidth - marginX,
+        marginX + headerHeight + 7.3,
         { align: "right" }
       );
 
@@ -912,8 +912,11 @@ function AdminWorkspace() {
         pdf.setFont("helvetica", "normal");
         pdf.setFontSize(5.45);
         pdf.setTextColor(...muted);
+        const employeeLabel = row.employee_number
+          ? ` (Emp ID: #${row.employee_number})`
+          : "";
         pdf.text(
-          `Driver: ${shortText(row.driver_name || "Unknown", cardWidth - 5)}`,
+          `Driver: ${shortText(`${row.driver_name || "Unknown"}${employeeLabel}`, cardWidth - 5)}`,
           x + 2.5,
           y + 9.2
         );
