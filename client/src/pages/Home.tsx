@@ -11,11 +11,11 @@ import { RovayaBrand } from "@/components/RovayaBrand";
 
 const photoSlots = [
   { id: "front", label: "Front", helper: "Headlamps & plate" },
-  { id: "rear", label: "Rear", helper: "Doors & lights" },
   { id: "left", label: "Left side", helper: "Body & tyres" },
   { id: "right", label: "Right side", helper: "Body & tyres" },
-  { id: "cab", label: "Cab interior", helper: "Controls & seat" },
+  { id: "cab", label: "Interior", helper: "Controls & seat" },
   { id: "dashboard", label: "Dashboard", helper: "Warning lights" },
+  { id: "rear", label: "Rear", helper: "Doors & lights" },
 ] as const;
 
 type ChecklistSection = { id: string; number: string; title: string; note: string; items: { id: string; label: string; required: boolean }[] };

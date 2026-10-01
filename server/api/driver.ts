@@ -1,7 +1,7 @@
 import type { Env } from "../_core/worker-env";
 import { edgeCached, HttpError, json, readJson, str, UUID_RE, type ApiContext } from "./http";
 
-export const PHOTO_TYPES = ["selfie", "front", "rear", "left", "right", "cab", "dashboard"] as const;
+export const PHOTO_TYPES = ["selfie", "front", "left", "right", "cab", "dashboard", "rear"] as const;
 const IMAGE_EXTENSIONS: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 const MAX_OBJECTS_PER_INSPECTION = 16;
@@ -87,6 +87,7 @@ export async function handlePhotoUpload({ request, env, url }: ApiContext): Prom
 
 type SubmitBody = {
   inspectionId?: string;
+  inspectionDate?: string;
   code?: string;
   fullName?: string;
   employeeNumber?: string;
@@ -107,8 +108,10 @@ export async function handleSubmitInspection({ request, env }: ApiContext): Prom
   const body = await readJson<SubmitBody>(request);
   const inspectionId = str(body.inspectionId, 64);
   const fullName = str(body.fullName, 200);
+  const inspectionDate = str(body.inspectionDate, 10);
   if (!UUID_RE.test(inspectionId)) throw new HttpError(400, "inspectionId must be a valid UUID.");
   if (!fullName) throw new HttpError(400, "Full names and surnames are required.");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(inspectionDate)) throw new HttpError(400, "A valid inspection date is required.");
   const shift = str(body.shift, 20).toLowerCase();
   if (!SHIFTS.includes(shift)) throw new HttpError(400, "Choose a shift.");
   const km = body.openingKilometers === "" || body.openingKilometers == null ? null : Number(body.openingKilometers);
@@ -156,7 +159,7 @@ export async function handleSubmitInspection({ request, env }: ApiContext): Prom
       `INSERT INTO daily_inspections (id, company_id, truck_id, driver_id, checklist_template_id, inspection_date, started_at, submitted_at,
          status, notes, signature_name, driver_name, employee_number, opening_kilometers, shift, company_access_code, created_at)
        VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(inspectionId, company.id, truck.id, template.id, now.slice(0, 10), now, now, notes, fullName, fullName, str(body.employeeNumber, 100) || null, km, shift, str(body.code, 100), now),
+    ).bind(inspectionId, company.id, truck.id, template.id, inspectionDate, now, now, notes, fullName, fullName, str(body.employeeNumber, 100) || null, km, shift, str(body.code, 100), now),
     env.DB.prepare(
       `INSERT INTO inspection_answers (id, inspection_id, checklist_item_id, result, created_at)
        SELECT json_extract(value,'$[0]'), ?1, json_extract(value,'$[1]'), json_extract(value,'$[2]'), ?2 FROM json_each(?3)`
