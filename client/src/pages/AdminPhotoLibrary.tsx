@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { deleteR2InspectionPhoto, supabase } from "@/lib/supabase";
+import { adminApi } from "@/lib/api";
 
 type FleetOption = { fleet_number: string; registration: string };
 type CompanyInfo = { id: string; name: string; photo_retention_days: number | null };
@@ -45,35 +45,19 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
   }, [company?.id, company?.photo_retention_days]);
 
   const search = async () => {
-    if (!supabase || !selectedCompanyId) return;
+    if (!selectedCompanyId) return;
     setLoading(true); setSearched(true);
-    const client = supabase;
-    let inspectionQuery = client.from("daily_inspections").select("id, inspection_date, driver_name, truck:trucks(fleet_number, registration)").eq("company_id", selectedCompanyId).order("inspection_date", { ascending: false }).limit(300);
-    if (date) inspectionQuery = inspectionQuery.eq("inspection_date", date);
-    const { data: inspectionRows, error: inspectionError } = await inspectionQuery;
-    if (inspectionError) { toast.error(inspectionError.message); setLoading(false); return; }
-    const matching = ((inspectionRows ?? []) as any[]).filter((row) => !fleet || row.truck?.fleet_number === fleet);
-    const inspectionIds = matching.map((row) => row.id);
-    if (inspectionIds.length === 0) { setPhotos([]); setSelectedIds(new Set()); setLoading(false); return; }
-    const { data: photoRows, error: photoError } = await client.from("inspection_photos").select("id, inspection_id, photo_type, storage_path, storage_provider, captured_at").in("inspection_id", inspectionIds).order("captured_at", { ascending: false });
-    if (photoError) { toast.error(photoError.message); setLoading(false); return; }
-    const inspectionById = new Map(matching.map((row) => [row.id, row]));
-    const withUrls = await Promise.all(((photoRows ?? []) as any[]).map(async (photo): Promise<LibraryPhoto> => {
-      const inspection = inspectionById.get(photo.inspection_id);
-      // R2-backed photos (storage_provider === "r2") go through the get-r2-photo-url Edge
-      // Function instead of createSignedUrl, since that bucket isn't Supabase Storage —
-      // see supabase/functions/get-r2-photo-url/index.ts for the access-control story.
-      const signedUrl = photo.storage_provider === "r2"
-        ? (await client.functions.invoke("get-r2-photo-url", { body: { storagePath: photo.storage_path } })).data?.signedUrl
-        : (await client.storage.from("inspection-photos").createSignedUrl(photo.storage_path, 3600)).data?.signedUrl;
-      return {
-        id: photo.id, inspection_id: photo.inspection_id, photo_type: photo.photo_type, storage_path: photo.storage_path, storage_provider: photo.storage_provider, captured_at: photo.captured_at,
-        url: signedUrl,
-        fleet_number: inspection?.truck?.fleet_number || "Unknown", registration: inspection?.truck?.registration || "",
-        driver_name: inspection?.driver_name || null, inspection_date: inspection?.inspection_date || "",
-      };
-    }));
-    setPhotos(withUrls); setSelectedIds(new Set()); setLoading(false);
+    try {
+      // One request: the Worker finds matching inspections, their photos, and returns ready-to-use signed links
+      // (served from R2 through the Cloudflare CDN cache, never from Supabase).
+      const query = new URLSearchParams({ companyId: selectedCompanyId, date, fleet });
+      const rows = await adminApi.get<LibraryPhoto[]>(`photos?${query.toString()}`);
+      setPhotos(rows); setSelectedIds(new Set());
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Unable to load photos.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const toggleSelected = (id: string) => setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
@@ -82,22 +66,11 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
   const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
 
   const deletePhotos = async (targets: LibraryPhoto[]) => {
-    if (!supabase || targets.length === 0) return;
-    const deletable = targets.filter((p) => p.storage_provider !== "r2");
-    const r2Targets = targets.filter((p) => p.storage_provider === "r2");
+    if (targets.length === 0) return;
     if (!window.confirm(`Delete ${targets.length} photo${targets.length === 1 ? "" : "s"}? This cannot be undone.`)) return;
     setDeleting(true);
     try {
-      for (const photo of r2Targets) {
-        const result = await deleteR2InspectionPhoto(photo.id, photo.storage_path, supabase);
-        if (result.error) throw result.error;
-      }
-      if (deletable.length > 0) {
-        const { error: storageError } = await supabase.storage.from("inspection-photos").remove(deletable.map((p) => p.storage_path));
-        if (storageError) throw storageError;
-        const { error: rowError } = await supabase.from("inspection_photos").delete().in("id", deletable.map((p) => p.id));
-        if (rowError) throw rowError;
-      }
+      await adminApi.post("photos/delete", { ids: targets.map((p) => p.id) });
       const deletedIds = new Set(targets.map((p) => p.id));
       await onAudit?.("photo", targets.map((p) => p.id).join(","), "deleted", { count: targets.length, fleet: targets[0]?.fleet_number });
       toast.success(`${targets.length} photo${targets.length === 1 ? "" : "s"} deleted.`);
@@ -147,7 +120,7 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
   };
 
   const saveRetention = async () => {
-    if (!supabase || !selectedCompanyId) return;
+    if (!selectedCompanyId) return;
     const trimmed = retentionInput.trim();
     let value: number | null = null;
     if (trimmed !== "") {
@@ -156,9 +129,9 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
       value = parsed;
     }
     setSavingRetention(true);
-    const { error } = await supabase.from("companies").update({ photo_retention_days: value }).eq("id", selectedCompanyId);
+    try { await adminApi.patch(`companies/${selectedCompanyId}`, { photo_retention_days: value }); }
+    catch (error) { setSavingRetention(false); return toast.error(error instanceof Error ? error.message : "Unable to save the retention period."); }
     setSavingRetention(false);
-    if (error) return toast.error(error.message);
     await onAudit?.("company", selectedCompanyId, "retention_changed", { photo_retention_days: value });
     toast.success(value ? `Evidence photos will auto-delete ${value} days after capture.` : "Automatic photo deletion turned off.");
     await onRetentionSaved();
@@ -251,7 +224,7 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
               <span className="text-xs text-[#718070]">days</span>
               <Button type="button" onClick={() => void saveRetention()} disabled={savingRetention} className="h-10 rounded-xl bg-[#2f4638] px-5 text-xs font-bold text-white disabled:opacity-60">{savingRetention ? "Saving…" : "Save"}</Button>
             </div>
-            <p className="mt-2 text-[11px] text-[#a2aa9f]">Enforced by a nightly cleanup job on the database — requires the <code>16_evidence_photo_retention.sql</code> migration to be applied once in Supabase.</p>
+            <p className="mt-2 text-[11px] text-[#a2aa9f]">Enforced by a nightly Cloudflare job (03:00 SAST) that removes both the record and the stored file. Photos are kept 30 days when this is left blank.</p>
           </div>
         </div>
       )}

@@ -5,7 +5,7 @@ import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recha
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { supabase } from "@/lib/supabase";
+import { adminApi } from "@/lib/api";
 import { type FleetRole, useFleetAuth } from "@/contexts/FleetAuthContext";
 import Login from "@/pages/Login";
 import AdminPhotoLibrary from "@/pages/AdminPhotoLibrary";
@@ -79,80 +79,86 @@ function AdminWorkspace() {
   const [companyForm, setCompanyForm] = useState({ name: "" });
   const [editingTruckId, setEditingTruckId] = useState<string | null>(null); const [fleetFilter, setFleetFilter] = useState(""); const [openFleet, setOpenFleet] = useState(false); const [openAdmins, setOpenAdmins] = useState(false); const [openMissed, setOpenMissed] = useState(false); const [openCard, setOpenCard] = useState<"admin" | "truck" | "company" | null>(null); const [reportDate, setReportDate] = useState(() => new Date().toISOString().slice(0, 10)); const [selectedPhoto, setSelectedPhoto] = useState<SelectedPhoto | null>(null); const [expandedReportIds, setExpandedReportIds] = useState<Set<string>>(new Set()); const toggleReportRow = (id: string) => setExpandedReportIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
 
+  // All data comes from the Cloudflare Worker API (D1 + R2 behind the edge cache); Supabase is only used to sign in.
+  const errMsg = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
   const loadCompanies = async () => {
-    if (!supabase) return;
-    const { data, error } = await supabase.from("companies").select("id, name, active, photo_retention_days").order("name");
-    if (error) return toastError(error.message);
-    const list = (data ?? []) as AdminCompany[]; setCompanies(list);
-    setSelectedCompanyId((current) => current ?? (isSuperAdmin ? list[0]?.id ?? null : profile?.company_id ?? null));
+    try {
+      const list = await adminApi.get<AdminCompany[]>("companies"); setCompanies(list);
+      setSelectedCompanyId((current) => current ?? (isSuperAdmin ? list[0]?.id ?? null : profile?.company_id ?? null));
+    } catch (error) { toastError(errMsg(error, "Unable to load companies.")); }
   };
 
   const load = async () => {
-    if (!supabase || !selectedCompanyId) { setLoading(false); return; } const client = supabase; setLoading(true);
-    const [{ data: truckData, error: truckError }, { data: adminData, error: adminError }, { data: reportData, error: reportError }] = await Promise.all([
-      supabase.from("trucks").select("id, fleet_number, registration, truck_type, model, size, status, license_disc_expiry, roadworthy_expiry, insurance_expiry, next_service_km").eq("company_id", selectedCompanyId).order("fleet_number"),
-      supabase.from("drivers").select("id, auth_user_id, employee_number, full_name, phone, role, company_id, active").eq("company_id", selectedCompanyId).order("full_name"),
-      supabase.from("daily_inspections").select("id, inspection_date, started_at, submitted_at, status, notes, driver_name, employee_number, opening_kilometers, shift, truck:trucks(fleet_number, registration, model), answers:inspection_answers(result, checklist_item:checklist_items(prompt, section_title, sort_order)), photos:inspection_photos(id, photo_type, storage_path, captured_at)").eq("inspection_date", reportDate).eq("company_id", selectedCompanyId).order("created_at", { ascending: false }),
+    if (!selectedCompanyId) { setLoading(false); return; } setLoading(true);
+    const companyQuery = `companyId=${encodeURIComponent(selectedCompanyId)}`;
+    const [truckResult, adminResult, reportResult] = await Promise.allSettled([
+      adminApi.get<AdminTruck[]>(`trucks?${companyQuery}`),
+      adminApi.get<AdminAccount[]>(`drivers?${companyQuery}`),
+      adminApi.get<ReportRow[]>(`reports?${companyQuery}&date=${reportDate}`),
     ]);
-    if (truckError || adminError || reportError) toastError((truckError || adminError || reportError)?.message || "Unable to load admin data.");
-    setTrucks((truckData ?? []) as AdminTruck[]); setAdmins((adminData ?? []) as AdminAccount[]);
-    const rows = (reportData ?? []) as unknown as ReportRow[];
-    // Sign each inspection's own photos in place so every fleet's evidence set (selfie + six angles) stays grouped together.
-    const withSignedPhotos = await Promise.all(rows.map(async (row) => {
-      const photos = await Promise.all((row.photos ?? []).map(async (photo) => { const result = await client.storage.from("inspection-photos").createSignedUrl(photo.storage_path, 3600); return { ...photo, url: result.data?.signedUrl }; }));
-      return { ...row, photos };
-    }));
-    setReports(withSignedPhotos); setExpandedReportIds(new Set()); setLoading(false);
+    const failed = [truckResult, adminResult, reportResult].find((result) => result.status === "rejected") as PromiseRejectedResult | undefined;
+    if (failed) toastError(errMsg(failed.reason, "Unable to load admin data."));
+    setTrucks(truckResult.status === "fulfilled" ? truckResult.value : []); setAdmins(adminResult.status === "fulfilled" ? adminResult.value : []);
+    // Photo links arrive already signed by the Worker, so evidence sets stay grouped per inspection with no extra requests.
+    setReports(reportResult.status === "fulfilled" ? reportResult.value : []); setExpandedReportIds(new Set()); setLoading(false);
   };
   const logAudit = async (entityType: string, entityId: string, action: string, metadata: Record<string, unknown> = {}) => {
-    if (!supabase || !profile?.id) return;
-    await supabase.from("audit_events").insert({ actor_id: profile.id, entity_type: entityType, entity_id: entityId, action, metadata, company_id: selectedCompanyId });
+    if (!profile?.id || !selectedCompanyId) return;
+    try { await adminApi.post("audit", { companyId: selectedCompanyId, entity_type: entityType, entity_id: entityId, action, metadata }); } catch { /* the audit trail must never block the action itself */ }
   };
   const loadDefects = async () => {
-    if (!supabase || !selectedCompanyId) return;
-    const { data, error } = await supabase.from("defects").select("id, category, severity, title, description, status, created_at, resolved_at, inspection:daily_inspections!inner(inspection_date, driver_name, company_id, truck:trucks(fleet_number, registration))").eq("inspection.company_id", selectedCompanyId).order("created_at", { ascending: false });
-    if (error) return toastError(error.message);
-    setDefects((data ?? []) as unknown as AdminDefect[]);
+    if (!selectedCompanyId) return;
+    try { setDefects(await adminApi.get<AdminDefect[]>(`defects?companyId=${encodeURIComponent(selectedCompanyId)}`)); } catch (error) { toastError(errMsg(error, "Unable to load defects.")); }
   };
   const updateDefectStatus = async (defect: AdminDefect, status: AdminDefect["status"]) => {
-    if (!supabase) return;
-    const payload: Record<string, unknown> = { status };
-    payload.resolved_by = status === "resolved" ? profile?.id ?? null : null;
-    payload.resolved_at = status === "resolved" ? new Date().toISOString() : null;
-    const { error } = await supabase.from("defects").update(payload).eq("id", defect.id);
-    if (error) return toastError(error.message);
+    try { await adminApi.patch(`defects/${defect.id}`, { status }); } catch (error) { return toastError(errMsg(error, "Unable to update the defect.")); }
     await logAudit("defect", defect.id, `status → ${status}`, { title: defect.title });
     toastSuccess("Defect updated.");
     await loadDefects();
   };
   const loadAuditEvents = async () => {
-    if (!supabase || !selectedCompanyId) return;
-    const { data, error } = await supabase.from("audit_events").select("id, entity_type, entity_id, action, metadata, created_at").eq("company_id", selectedCompanyId).order("created_at", { ascending: false }).limit(100);
-    if (error) return toastError(error.message);
-    setAuditEvents((data ?? []) as AuditEvent[]);
+    if (!selectedCompanyId) return;
+    try { setAuditEvents(await adminApi.get<AuditEvent[]>(`audit?companyId=${encodeURIComponent(selectedCompanyId)}`)); } catch (error) { toastError(errMsg(error, "Unable to load the audit trail.")); }
   };
   useEffect(() => { void loadCompanies(); }, []);
   useEffect(() => { void load(); void loadDefects(); void loadAuditEvents(); }, [reportDate, selectedCompanyId]);
 
   const createCompany = async (event: React.FormEvent) => {
-    event.preventDefault(); if (!supabase) return;
+    event.preventDefault();
     const name = companyForm.name.trim(); if (!name) return toastError("Company name is required.");
-    const slug = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Math.random().toString(36).slice(2, 6)}`;
-    const { data: company, error } = await supabase.from("companies").insert({ name, slug }).select("id").single();
-    if (error || !company) return toastError(error?.message || "Unable to create company.");
-    const code = `${name.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 8)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-    const { error: codeError } = await supabase.from("company_access_codes").insert({ company_id: company.id, code });
-    if (codeError) return toastError(codeError.message);
-    const { error: templateError } = await supabase.from("checklist_templates").insert({ company_id: company.id, title: `${name} checklist v1`, version: 1, active: true });
-    if (templateError) return toastError(templateError.message);
-    toastSuccess(`${name} created. Driver access code: ${code}`);
-    setCompanyForm({ name: "" }); setOpenCard(null); setSelectedCompanyId(company.id); await loadCompanies();
+    try {
+      const company = await adminApi.post<{ id: string; name: string; code: string }>("companies", { name });
+      toastSuccess(`${name} created. Driver access code: ${company.code}`);
+      setCompanyForm({ name: "" }); setOpenCard(null); setSelectedCompanyId(company.id); await loadCompanies();
+    } catch (error) { toastError(errMsg(error, "Unable to create company.")); }
   };
 
-  const saveTruck = async (event: React.FormEvent) => { event.preventDefault(); if (!supabase || !selectedCompanyId) return; const payload = { fleet_number: formatFleetNumber(truckForm.fleet_number), registration: truckForm.registration.trim().toUpperCase(), truck_type: truckForm.truck_type.trim() || null, model: truckForm.model.trim() || null, size: truckForm.size.trim() || null, status: truckForm.status, company_id: selectedCompanyId, license_disc_expiry: truckForm.license_disc_expiry || null, roadworthy_expiry: truckForm.roadworthy_expiry || null, insurance_expiry: truckForm.insurance_expiry || null, next_service_km: truckForm.next_service_km === "" ? null : Number(truckForm.next_service_km) }; if (!payload.fleet_number || !payload.registration) return toastError("Fleet number and registration are required."); const result = editingTruckId ? await supabase.from("trucks").update(payload).eq("id", editingTruckId) : await supabase.from("trucks").insert(payload); if (result.error) return toastError(result.error.message); await logAudit("truck", editingTruckId ?? payload.fleet_number, editingTruckId ? "updated" : "created", { fleet_number: payload.fleet_number }); toastSuccess(editingTruckId ? "Vehicle updated." : "Vehicle added."); setTruckForm({ fleet_number: "", registration: "", truck_type: "", model: "", size: "", status: "ready", license_disc_expiry: "", roadworthy_expiry: "", insurance_expiry: "", next_service_km: "" }); setEditingTruckId(null); setOpenCard(null); await load(); };
-  const saveAdmin = async (event: React.FormEvent) => { event.preventDefault(); if (!supabase || !selectedCompanyId) return; const payload = { auth_user_id: adminForm.auth_user_id.trim() || null, employee_number: adminForm.employee_number.trim() || null, full_name: adminForm.full_name.trim(), phone: adminForm.phone.trim() || null, role: "admin" as FleetRole, company_id: selectedCompanyId, active: true }; if (!payload.full_name) return toastError("Name is required."); const { error } = await supabase.from("drivers").insert(payload); if (error) return toastError(error.message); toastSuccess("Company admin added."); setAdminForm({ auth_user_id: "", employee_number: "", full_name: "", phone: "" }); setOpenCard(null); await load(); };
-  const deleteTruck = async (truck: AdminTruck) => { if (!supabase || !window.confirm(`Delete fleet ${truck.fleet_number}? This cannot be undone.`)) return; const { error } = await supabase.from("trucks").delete().eq("id", truck.id); if (error) return toastError(error.message); await logAudit("truck", truck.id, "deleted", { fleet_number: truck.fleet_number, registration: truck.registration }); toastSuccess("Vehicle deleted."); await load(); };
-  const deleteAdmin = async (admin: AdminAccount) => { if (!supabase || !window.confirm(`Remove ${admin.full_name}'s admin access?`)) return; const { error } = await supabase.from("drivers").delete().eq("id", admin.id); if (error) return toastError(error.message); await logAudit("admin", admin.id, "removed", { full_name: admin.full_name }); toastSuccess("Admin access removed."); await load(); };
+  const saveTruck = async (event: React.FormEvent) => {
+    event.preventDefault(); if (!selectedCompanyId) return;
+    const payload = { id: editingTruckId ?? undefined, companyId: selectedCompanyId, fleet_number: formatFleetNumber(truckForm.fleet_number), registration: truckForm.registration.trim().toUpperCase(), truck_type: truckForm.truck_type.trim() || null, model: truckForm.model.trim() || null, size: truckForm.size.trim() || null, status: truckForm.status, license_disc_expiry: truckForm.license_disc_expiry || null, roadworthy_expiry: truckForm.roadworthy_expiry || null, insurance_expiry: truckForm.insurance_expiry || null, next_service_km: truckForm.next_service_km === "" ? null : Number(truckForm.next_service_km) };
+    if (!payload.fleet_number || !payload.registration) return toastError("Fleet number and registration are required.");
+    try { await adminApi.post("trucks", payload); } catch (error) { return toastError(errMsg(error, "Unable to save the vehicle.")); }
+    await logAudit("truck", editingTruckId ?? payload.fleet_number, editingTruckId ? "updated" : "created", { fleet_number: payload.fleet_number });
+    toastSuccess(editingTruckId ? "Vehicle updated." : "Vehicle added.");
+    setTruckForm({ fleet_number: "", registration: "", truck_type: "", model: "", size: "", status: "ready", license_disc_expiry: "", roadworthy_expiry: "", insurance_expiry: "", next_service_km: "" }); setEditingTruckId(null); setOpenCard(null); await load();
+  };
+  const saveAdmin = async (event: React.FormEvent) => {
+    event.preventDefault(); if (!selectedCompanyId) return;
+    const payload = { companyId: selectedCompanyId, auth_user_id: adminForm.auth_user_id.trim() || null, employee_number: adminForm.employee_number.trim() || null, full_name: adminForm.full_name.trim(), phone: adminForm.phone.trim() || null };
+    if (!payload.full_name) return toastError("Name is required.");
+    try { await adminApi.post("drivers", payload); } catch (error) { return toastError(errMsg(error, "Unable to add the admin.")); }
+    toastSuccess("Company admin added."); setAdminForm({ auth_user_id: "", employee_number: "", full_name: "", phone: "" }); setOpenCard(null); await load();
+  };
+  const deleteTruck = async (truck: AdminTruck) => {
+    if (!window.confirm(`Delete fleet ${truck.fleet_number}? This cannot be undone.`)) return;
+    try { await adminApi.delete(`trucks/${truck.id}`); } catch (error) { return toastError(errMsg(error, "Unable to delete the vehicle.")); }
+    await logAudit("truck", truck.id, "deleted", { fleet_number: truck.fleet_number, registration: truck.registration }); toastSuccess("Vehicle deleted."); await load();
+  };
+  const deleteAdmin = async (admin: AdminAccount) => {
+    if (!window.confirm(`Remove ${admin.full_name}'s admin access?`)) return;
+    try { await adminApi.delete(`drivers/${admin.id}`); } catch (error) { return toastError(errMsg(error, "Unable to remove the admin.")); }
+    await logAudit("admin", admin.id, "removed", { full_name: admin.full_name }); toastSuccess("Admin access removed."); await load();
+  };
   const exportFleet = () => { const rows = [["Fleet number", "Registration", "Vehicle type", "Model", "Size", "Status"], ...trucks.map((t) => [t.fleet_number, t.registration, t.truck_type ?? "", t.model ?? "", t.size ?? "", t.status])]; const csv = rows.map((row) => row.map((v) => `"${String(v).replaceAll('"', '""')}"`).join(",")).join("\n"); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); link.download = `${(companies.find((c) => c.id === selectedCompanyId)?.name || "rovaya").toLowerCase().replace(/[^a-z0-9]+/g, "-")}-fleet-${reportDate}.csv`; link.click(); };
   const filteredReports = reports.filter((row) => !fleetFilter || row.truck?.fleet_number?.toLowerCase().includes(fleetFilter.toLowerCase()));
   const selectedCompany = companies.find((c) => c.id === selectedCompanyId) ?? null;
