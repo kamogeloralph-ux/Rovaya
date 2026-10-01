@@ -1,7 +1,7 @@
 name: Deploy Cloudflare Worker
 
 # Requires two repo secrets (Settings -> Secrets and variables -> Actions):
-#   CLOUDFLARE_API_TOKEN  - a Cloudflare API token with Workers Scripts:Edit
+#   CLOUDFLARE_API_TOKEN  - a Cloudflare API token with Workers Scripts:Edit and D1:Edit
 #   CLOUDFLARE_ACCOUNT_ID - your Cloudflare account ID
 # Also requires the Worker's own runtime secrets to already be set via
 # `wrangler secret put <NAME>` (JWT_SECRET, SUPABASE_URL, etc.) — this
@@ -32,6 +32,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
+
+      - name: Apply D1 migrations
+        uses: cloudflare/wrangler-action@v3
+        with:
+          wranglerVersion: "4.131.0"
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 migrations apply rovaya-d1 --remote
 
       - name: Configure R2 browser CORS
         uses: cloudflare/wrangler-action@v3
