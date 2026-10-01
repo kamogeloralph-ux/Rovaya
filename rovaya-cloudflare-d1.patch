@@ -1,0 +1,2014 @@
+diff --git a/.gitignore b/.gitignore
+index c7e5630..c44ec9f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -112,3 +112,4 @@ temp/
+ # Manus version file (auto-generated, not part of source)
+ client/public/__manus__/version.json
+ .project-config.json
++.wrangler/
+diff --git a/EGRESS_FIX.md b/EGRESS_FIX.md
+new file mode 100644
+index 0000000..c0559ef
+--- /dev/null
++++ b/EGRESS_FIX.md
+@@ -0,0 +1,31 @@
++# Cloudflare-first data path (zero Supabase egress)
++
++```
++Phone / admin browser
++   -> Cloudflare Pages (static app, CDN)
++   -> Cloudflare Worker  /api/v1/*   <- edge cache in front of everything below
++        |-- D1  (rovaya-d1)  all fleet data
++        |-- R2               photos (served through the CDN cache with signed links)
++        '-- Supabase Auth    sign-in only (token issue/refresh, ~1 KB)
++```
++
++Supabase tables, Storage and Edge Functions are no longer called by the app.
++
++## What changed
++| Before | After |
++| --- | --- |
++| Driver app queried `trucks`, `checklist_*` and the company code on every session | One cached `GET /driver/bootstrap` (edge 5 min + browser + service worker + offline copy) |
++| Submit = 6 Supabase writes | One idempotent `POST /driver/inspections` -> single atomic D1 batch |
++| Photo upload via Supabase Edge Function + presigned R2 URL | `POST /driver/photo` straight into R2, idempotent per photo slot |
++| Admin loaded nested joins and signed every photo on every load | `GET /admin/reports` -> one query set; signed photo links are stable for 6h so the CDN/browser cache them |
++| Nightly pg_cron deleted photo rows but left the R2 files | Worker cron (03:00 SAST) deletes rows **and** files, plus an orphan sweep |
++| Worker verified admin tokens by calling Supabase | Tokens verified locally with Supabase's public signing keys (fetched at most hourly) |
++
++## Deploy
++1. Merge to `main` (Pages + Worker deploy automatically). `rovaya-d1` is already created, migrated and loaded.
++2. Optional Worker secret `SUPABASE_JWT_SECRET`: only if admin login fails with 401 and the project still uses a legacy HS256 secret.
++3. After deploy, run a final delta sync of any inspections submitted during the cutover window.
++4. In Supabase, disable the `purge-expired-inspection-photos` and `cleanup-30-day-photo-metadata` cron jobs.
++
++## D1 free-tier limits are per ACCOUNT
++Row-write (100K/day) and row-read (5M/day) allowances are shared by every D1 database on the account. If another project exhausts them, writes fail until 00:00 UTC. The Worker returns a retryable 503 in that case and the driver app keeps the inspection on the phone and retries automatically.
+diff --git a/client/public/sw.js b/client/public/sw.js
+index 88d697d..3503a06 100644
+--- a/client/public/sw.js
++++ b/client/public/sw.js
+@@ -1,5 +1,6 @@
+ // Field Ledger direction: offline resilience supports the field workflow without hiding the sync state.
+-const CACHE_NAME = "field-ledger-shell-v2";
++const CACHE_NAME = "field-ledger-shell-v3";
++const BOOTSTRAP_PATH = "/api/v1/driver/bootstrap";
+ 
+ self.addEventListener("install", (event) => {
+   const scope = self.registration.scope;
+@@ -26,6 +27,26 @@ self.addEventListener("sync", (event) => {
+ 
+ self.addEventListener("fetch", (event) => {
+   if (event.request.method !== "GET") return;
++  const url = new URL(event.request.url);
++
++  // Fleet list + checklist: answer instantly from the phone's copy and refresh it in the background, so
++  // opening the app on a weak signal costs no waiting (and the Cloudflare edge answers the refresh).
++  if (url.pathname === BOOTSTRAP_PATH) {
++    event.respondWith(
++      caches.open(CACHE_NAME).then(async (cache) => {
++        const cached = await cache.match(event.request);
++        const refresh = fetch(event.request).then((response) => { if (response.ok) cache.put(event.request, response.clone()); return response; });
++        if (cached) { event.waitUntil(refresh.catch(() => undefined)); return cached; }
++        return refresh.catch(() => new Response(JSON.stringify({ error: "You are offline." }), { status: 503, headers: { "content-type": "application/json" } }));
++      }),
++    );
++    return;
++  }
++
++  // Everything else that is not part of this app (admin API calls with sign-in tokens, signed photo links,
++  // Supabase sign-in) is never stored by the service worker.
++  if (url.origin !== self.location.origin) return;
++
+   event.respondWith(
+     fetch(event.request)
+       .then((response) => {
+diff --git a/client/src/lib/api.ts b/client/src/lib/api.ts
+new file mode 100644
+index 0000000..fc99316
+--- /dev/null
++++ b/client/src/lib/api.ts
+@@ -0,0 +1,95 @@
++/*
++  Client for the Rovaya Worker API (Cloudflare Worker + D1 + R2, fronted by the edge cache).
++  Drivers call the public /driver/* routes with their company code; admins call /admin/* with their
++  Supabase access token, which the Worker verifies locally (no Supabase round trip).
++*/
++import { supabase, type StoredCompany } from "./supabase";
++
++export const API_BASE = (
++  (import.meta.env.VITE_API_URL as string | undefined) ??
++  (import.meta.env.VITE_R2_API_URL as string | undefined) ??
++  "https://rovaya-api.kamogeloralph.workers.dev"
++).replace(/\/$/, "") + "/api/v1";
++
++export class ApiError extends Error {
++  constructor(message: string, public status: number, public retryable = false) {
++    super(message);
++  }
++}
++
++type Options = { method?: string; body?: unknown; auth?: boolean; raw?: { body: Blob | File; contentType: string } };
++
++async function accessToken(): Promise<string> {
++  if (!supabase) throw new ApiError("Sign-in is not configured.", 401);
++  const { data, error } = await supabase.auth.getSession(); // reads local storage; refreshes only when expired
++  if (error || !data.session?.access_token) throw new ApiError("Your admin session has expired. Please sign in again.", 401);
++  return data.session.access_token;
++}
++
++export async function api<T = unknown>(path: string, options: Options = {}): Promise<T> {
++  const headers: Record<string, string> = {};
++  if (options.auth) headers.authorization = `Bearer ${await accessToken()}`;
++  let body: BodyInit | undefined;
++  if (options.raw) { headers["content-type"] = options.raw.contentType; body = options.raw.body; }
++  else if (options.body !== undefined) { headers["content-type"] = "application/json"; body = JSON.stringify(options.body); }
++  const response = await fetch(`${API_BASE}${path}`, { method: options.method ?? "GET", headers, body }); // network failure -> TypeError (retryable)
++  const payload = await response.json().catch(() => ({}));
++  if (!response.ok) throw new ApiError((payload as { error?: string }).error || `Request failed (${response.status}).`, response.status, Boolean((payload as { retryable?: boolean }).retryable));
++  return payload as T;
++}
++
++export const adminApi = {
++  get: <T = unknown>(path: string) => api<T>(`/admin/${path}`, { auth: true }),
++  post: <T = unknown>(path: string, body: unknown) => api<T>(`/admin/${path}`, { method: "POST", body, auth: true }),
++  patch: <T = unknown>(path: string, body: unknown) => api<T>(`/admin/${path}`, { method: "PATCH", body, auth: true }),
++  delete: <T = unknown>(path: string) => api<T>(`/admin/${path}`, { method: "DELETE", auth: true }),
++};
++
++// ---- driver workflow -------------------------------------------------------------------
++export type DriverBootstrap = {
++  company: StoredCompany;
++  trucks: { fleet_number: string; registration: string }[];
++  checklist: { templateId: string | null; items: { id: string; section_number: string; section_title: string; prompt: string; sort_order: number; required: boolean }[] };
++};
++
++const BOOTSTRAP_CACHE_PREFIX = "field-ledger-bootstrap:";
++
++/**
++ * One request returns company, fleet list and checklist. It is cached by the Cloudflare edge and the
++ * service worker; if the device is offline the last copy stored on the phone is used.
++ */
++export async function fetchBootstrap(code: string): Promise<DriverBootstrap> {
++  const trimmed = code.trim();
++  try {
++    const data = await api<DriverBootstrap>(`/driver/bootstrap?code=${encodeURIComponent(trimmed)}`);
++    try { window.localStorage.setItem(BOOTSTRAP_CACHE_PREFIX + trimmed, JSON.stringify(data)); } catch { /* storage full or blocked */ }
++    return data;
++  } catch (error) {
++    if (!(error instanceof ApiError) || error.status >= 500) {
++      try {
++        const stored = window.localStorage.getItem(BOOTSTRAP_CACHE_PREFIX + trimmed);
++        if (stored) return JSON.parse(stored) as DriverBootstrap;
++      } catch { /* fall through */ }
++    }
++    throw error;
++  }
++}
++
++export async function resolveCompanyCode(code: string): Promise<{ data: StoredCompany | null; error: Error | null }> {
++  const trimmed = code.trim();
++  if (!trimmed) return { data: null, error: new Error("Enter your company access code.") };
++  try {
++    const bootstrap = await fetchBootstrap(trimmed);
++    return { data: { ...bootstrap.company, code: trimmed }, error: null };
++  } catch (error) {
++    return { data: null, error: error instanceof Error ? error : new Error("Unable to check that access code.") };
++  }
++}
++
++export async function uploadDriverPhoto(file: File, inspectionId: string, photoType: string, code: string): Promise<{ objectKey: string }> {
++  const contentType = file.type || "image/jpeg";
++  return api<{ objectKey: string }>(
++    `/driver/photo?inspectionId=${encodeURIComponent(inspectionId)}&photoType=${encodeURIComponent(photoType)}&code=${encodeURIComponent(code)}`,
++    { method: "POST", raw: { body: file, contentType } }
++  );
++}
+diff --git a/client/src/lib/auth-flow.js b/client/src/lib/auth-flow.js
+index df56431..b83df15 100644
+--- a/client/src/lib/auth-flow.js
++++ b/client/src/lib/auth-flow.js
+@@ -1,12 +1,10 @@
+ import { supabase } from "./supabase";
++import { adminApi, ApiError } from "./api";
+ 
+ /**
+- * Sign in a driver or admin with Supabase Auth and load the
+- * matching public.drivers profile. The publishable browser key is sufficient;
++ * Sign in an admin with Supabase Auth (the only thing Supabase is used for), then load the matching
++ * fleet profile from the Cloudflare Worker / D1. The publishable browser key is sufficient;
+  * privileged keys must never be imported here.
+- *
+- * @param {{ email: string, password: string, expectedRole?: "driver" | "admin" }} input
+- * @returns {Promise<{ user: object, profile: object }>}
+  */
+ export function isAllowedRole(actualRole, expectedRole) {
+   if (!expectedRole) return true;
+@@ -15,25 +13,34 @@ export function isAllowedRole(actualRole, expectedRole) {
+   return false;
+ }
+ 
++// The profile rarely changes; keep it in memory so token refreshes and tab focus events never trigger a request.
++const PROFILE_TTL_MS = 5 * 60 * 1000;
++let profileCache = { userId: null, profile: null, at: 0 };
++const clearProfileCache = () => { profileCache = { userId: null, profile: null, at: 0 }; };
++
++async function loadProfile(userId) {
++  if (profileCache.userId === userId && profileCache.profile && Date.now() - profileCache.at < PROFILE_TTL_MS) return profileCache.profile;
++  const profile = await adminApi.get("me");
++  profileCache = { userId, profile, at: Date.now() };
++  return profile;
++}
++
+ export async function signInWithRole({ email, password, expectedRole }) {
+-  if (!supabase) throw new Error("Supabase is not configured.");
++  if (!supabase) throw new Error("Sign-in is not configured.");
++  clearProfileCache();
+ 
+-  const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+-    email: email.trim(),
+-    password,
+-  });
++  const { data: authData, error: authError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+   if (authError) throw authError;
+   if (!authData.user) throw new Error("Authentication did not return a user.");
+ 
+-  const { data: profile, error: profileError } = await supabase
+-    .from("drivers")
+-    .select("id, auth_user_id, employee_number, full_name, phone, role, company_id, active")
+-    .eq("auth_user_id", authData.user.id)
+-    .maybeSingle();
+-
+-  if (profileError) {
++  let profile;
++  try {
++    profile = await loadProfile(authData.user.id);
++  } catch (error) {
+     await supabase.auth.signOut();
+-    throw profileError;
++    clearProfileCache();
++    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) throw new Error("Your account is not linked to an active fleet profile.");
++    throw error;
+   }
+   if (!profile || !profile.active) {
+     await supabase.auth.signOut();
+@@ -43,11 +50,11 @@ export async function signInWithRole({ email, password, expectedRole }) {
+     await supabase.auth.signOut();
+     throw new Error(`This login is restricted to ${expectedRole} accounts.`);
+   }
+-
+   return { user: authData.user, profile };
+ }
+ 
+ export async function signOutUser() {
++  clearProfileCache();
+   if (!supabase) return;
+   const { error } = await supabase.auth.signOut();
+   if (error) throw error;
+@@ -61,23 +68,30 @@ export async function getCurrentFleetSession() {
+   const user = sessionData.session?.user ?? null;
+   if (!user) return { user: null, profile: null };
+ 
+-  const { data: profile, error: profileError } = await supabase
+-    .from("drivers")
+-    .select("id, auth_user_id, employee_number, full_name, phone, role, company_id, active")
+-    .eq("auth_user_id", user.id)
+-    .maybeSingle();
+-  if (profileError) throw profileError;
+-  if (!profile || !profile.active) {
+-    await supabase.auth.signOut();
+-    return { user: null, profile: null };
++  try {
++    const profile = await loadProfile(user.id);
++    if (!profile || !profile.active) {
++      await supabase.auth.signOut();
++      clearProfileCache();
++      return { user: null, profile: null };
++    }
++    return { user, profile };
++  } catch (error) {
++    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
++      await supabase.auth.signOut();
++      clearProfileCache();
++      return { user: null, profile: null };
++    }
++    throw error;
+   }
+-
+-  return { user, profile };
+ }
+ 
+ export function subscribeToFleetAuth(onChange) {
+   if (!supabase) return () => {};
+-  const { data } = supabase.auth.onAuthStateChange(() => {
++  const { data } = supabase.auth.onAuthStateChange((event) => {
++    // Token refreshes and the initial session never change who the user is, so they cost nothing.
++    if (event === "TOKEN_REFRESHED" || event === "INITIAL_SESSION") return;
++    if (event === "SIGNED_OUT") clearProfileCache();
+     void getCurrentFleetSession().then(onChange).catch(() => onChange({ user: null, profile: null }));
+   });
+   return () => data.subscription.unsubscribe();
+diff --git a/client/src/lib/inspection-sync.js b/client/src/lib/inspection-sync.js
+index 053a799..d1e7f87 100644
+--- a/client/src/lib/inspection-sync.js
++++ b/client/src/lib/inspection-sync.js
+@@ -1,4 +1,5 @@
+-import { driverSupabase, getStoredCompany, uploadInspectionPhotoToR2 } from "./supabase";
++import { getStoredCompany } from "./supabase";
++import { api, uploadDriverPhoto } from "./api";
+ 
+ const DRAFT_STORE = "field-ledger-inspection-drafts";
+ const DRAFT_KEY = "current";
+@@ -42,60 +43,30 @@ export async function clearInspectionDraft() { const db = await openDraftDb().ca
+ export function flattenChecklistItems(sections) { return sections.flatMap((section) => section.items); }
+ function readableError(error) { if (error instanceof Error) return error.message; if (error && typeof error === "object") { const message = error.message || error.details || error.hint; if (message) return String(message); } return "Unable to submit this inspection."; }
+ function retryableError(error) { if (typeof navigator !== "undefined" && !navigator.onLine) return true; const status = Number(error?.status || error?.statusCode || 0); if ([408, 429].includes(status) || status >= 500) return true; return error instanceof TypeError || /fetch|network|failed to fetch|timeout|temporar/i.test(readableError(error)); }
+-export function buildInspectionDraft({ step, fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued = false, syncStatus = null, syncAttempts = 0, lastSyncError = null, companyId = null, companyCode = null }) { return { companyId, companyCode, step, fullName, employeeNumber, selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued, syncStatus: syncStatus || (queued ? SYNC_STATES.savedOnDevice : SYNC_STATES.draft), syncAttempts, lastSyncError, savedAt: new Date().toISOString() }; }
++export function buildInspectionDraft({ inspectionId = null, step, fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued = false, syncStatus = null, syncAttempts = 0, lastSyncError = null, companyId = null, companyCode = null }) { return { inspectionId, companyId, companyCode, step, fullName, employeeNumber, selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, queued, syncStatus: syncStatus || (queued ? SYNC_STATES.savedOnDevice : SYNC_STATES.draft), syncAttempts, lastSyncError, savedAt: new Date().toISOString() }; }
+ export async function getInspectionSyncState() { const draft = await loadInspectionDraft(); const meta = readSyncMeta(); return { state: draft?.syncStatus || meta.state || SYNC_STATES.draft, pending: Boolean(draft?.queued), attempts: draft?.syncAttempts || 0, lastError: draft?.lastSyncError || meta.lastError || null, lastSyncAt: meta.lastSyncAt || null }; }
+ async function updateQueuedDraft(patch) { const draft = await loadInspectionDraft(); if (!draft?.queued) return; await saveInspectionDraft({ ...draft, ...patch, savedAt: new Date().toISOString() }); }
+ 
+-async function submitOnline({ fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, companyId, companyCode }) {
+-  if (!driverSupabase) throw new Error("Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.");
++async function submitOnline({ inspectionId: existingId, fullName, employeeNumber = "", selectedFleet, openingKilometers, shift, checks, itemNotes, notes, selfieFile, photoFiles, companyId, companyCode }) {
+   if (!fullName?.trim()) throw new Error("Full names and surnames are required.");
+   if (!companyId || !companyCode) throw new Error("No company selected. Please enter your company access code again.");
+-  const { data: truck, error: truckError } = await driverSupabase.from("trucks").select("id, fleet_number").eq("fleet_number", selectedFleet).eq("company_id", companyId).maybeSingle();
+-  if (truckError) throw truckError;
+-  if (!truck) throw new Error("The selected fleet number was not found for this company.");
+-  const { data: template, error: templateError } = await driverSupabase.from("checklist_templates").select("id, version").eq("company_id", companyId).eq("active", true).order("version", { ascending: false }).limit(1).maybeSingle();
+-  if (templateError) throw templateError;
+-  if (!template) throw new Error("No active checklist template exists for this company.");
+-  const { data: dbItems, error: itemError } = await driverSupabase.from("checklist_items").select("id, sort_order, prompt").eq("template_id", template.id).order("sort_order");
+-  if (itemError) throw itemError;
+-  if (!dbItems || dbItems.length === 0) throw new Error("This company's checklist has no items configured.");
+-  if (dbItems.some((item) => checks[item.id] === undefined)) throw new Error("The checklist has changed since you started. Please refresh and try again.");
+   if (!(selfieFile instanceof File) || selfieFile.size === 0) throw new Error("The selfie image is missing. Please capture the selfie again.");
+-  const inspectionDate = new Date().toISOString().slice(0, 10);
+-  const inspectionId = crypto.randomUUID();
+-  // Upload every photo BEFORE writing anything to the database. Previously the
+-  // daily_inspections row was inserted (status: "completed") first and photos were
+-  // uploaded afterward — so a failed or interrupted upload left a permanent
+-  // "completed" inspection record with missing evidence, since there was nothing to
+-  // roll it back. Uploading first means a failure here throws before any row exists,
+-  // so a retry (via the offline queue) starts clean instead of producing a duplicate,
+-  // partially-evidenced record. The remaining, much smaller risk — an upload
+-  // succeeding but a later DB write failing — only leaves unreferenced files in R2,
+-  // which is far safer than a false "completed" compliance record.
+-  const uploadedPhotos = [];
+-  const selfieUpload = await uploadInspectionPhotoToR2(selfieFile, inspectionId, "selfie", driverSupabase);
+-  if (selfieUpload.error) throw selfieUpload.error;
+-  uploadedPhotos.push({ inspection_id: inspectionId, photo_type: "selfie", storage_path: selfieUpload.data.storagePath, storage_provider: "r2", captured_at: new Date().toISOString() });
++  // The inspection id is created once per draft and reused on every retry. The Worker's upload and submit
++  // endpoints are both idempotent on it, so an interrupted attempt can never produce a duplicate record
++  // or a second copy of the same photo.
++  const inspectionId = existingId || crypto.randomUUID();
++  // Upload every photo BEFORE submitting the inspection. A failed or interrupted upload throws here, before
++  // any record exists, so a retry starts clean instead of leaving a "completed" inspection with missing evidence.
++  const photos = [];
++  const selfie = await uploadDriverPhoto(selfieFile, inspectionId, "selfie", companyCode);
++  photos.push({ photoType: "selfie", objectKey: selfie.objectKey });
+   for (const [photoType, file] of Object.entries(photoFiles ?? {})) {
+-    const upload = await uploadInspectionPhotoToR2(file, inspectionId, photoType, driverSupabase);
+-    if (upload.error) throw upload.error;
+-    uploadedPhotos.push({ inspection_id: inspectionId, photo_type: photoType, storage_path: upload.data.storagePath, storage_provider: "r2", captured_at: new Date().toISOString() });
++    const upload = await uploadDriverPhoto(file, inspectionId, photoType, companyCode);
++    photos.push({ photoType, objectKey: upload.objectKey });
+   }
+-  const payload = { id: inspectionId, driver_id: null, driver_name: fullName.trim(), employee_number: employeeNumber?.trim() || null, truck_id: truck.id, opening_kilometers: openingKilometers === "" || openingKilometers == null ? null : Number(openingKilometers), shift, checklist_template_id: template.id, inspection_date: inspectionDate, started_at: new Date().toISOString(), submitted_at: new Date().toISOString(), status: "completed", notes: notes?.trim() || null, signature_name: fullName.trim(), company_id: companyId, company_access_code: companyCode };
+-  const { error: inspectionError } = await driverSupabase.from("daily_inspections").insert(payload);
+-  if (inspectionError) throw inspectionError;
+-  const answers = dbItems.map((item) => ({ inspection_id: inspectionId, checklist_item_id: item.id, result: checks[item.id] ? "pass" : "fail" }));
+-  const { error: answerError } = await driverSupabase.from("inspection_answers").insert(answers);
+-  if (answerError) throw answerError;
+-  const failedItems = dbItems.filter((item) => !checks[item.id]);
+-  if (failedItems.length > 0) {
+-    const defectRows = failedItems.map((item) => ({ inspection_id: inspectionId, category: "checklist", severity: "medium", title: item.prompt || "Failed checklist item", description: itemNotes?.[item.id]?.trim() || null, status: "open", reported_by: null }));
+-    const { error: defectError } = await driverSupabase.from("defects").insert(defectRows);
+-    if (defectError) throw defectError;
+-  }
+-  const { error: photosError } = await driverSupabase.from("inspection_photos").insert(uploadedPhotos);
+-  if (photosError) throw photosError;
++  // One request writes the inspection, answers, defects and photo records atomically (Cloudflare D1).
++  await api("/driver/inspections", { method: "POST", body: { inspectionId, code: companyCode, fullName: fullName.trim(), employeeNumber: employeeNumber?.trim() || "", fleetNumber: selectedFleet, openingKilometers: openingKilometers === "" || openingKilometers == null ? null : Number(openingKilometers), shift, checks, itemNotes, notes: notes?.trim() || "", photos } });
+   return { queued: false, inspectionId };
+ }
+-export async function submitInspection({ allowQueue = true, ...draft }) { const queuedDraft = buildInspectionDraft({ ...draft, queued: true, syncStatus: SYNC_STATES.savedOnDevice }); const offline = !driverSupabase || (typeof navigator !== "undefined" && !navigator.onLine); if (offline) { if (!allowQueue) throw new Error("The connection is still offline."); await saveInspectionDraft(queuedDraft); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: "Waiting for an internet connection." }); return { queued: true }; } try { writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); const result = await submitOnline(draft); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return result; } catch (error) { if (allowQueue && retryableError(error)) { const attempts = (draft.syncAttempts || 0) + 1; await saveInspectionDraft({ ...queuedDraft, syncAttempts: attempts, lastSyncError: readableError(error) }); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: readableError(error) }); return { queued: true }; } throw new Error(readableError(error)); } }
+-export async function syncQueuedInspection({ checklistSections }) { if (!driverSupabase || (typeof navigator !== "undefined" && !navigator.onLine)) return null; const draft = await loadInspectionDraft(); if (!draft?.queued) return null; const attempts = (draft.syncAttempts || 0) + 1; await updateQueuedDraft({ syncStatus: SYNC_STATES.uploading, syncAttempts: attempts, lastSyncError: null }); writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); try { await updateQueuedDraft({ syncStatus: SYNC_STATES.syncing }); writeSyncMeta({ state: SYNC_STATES.syncing, pending: true }); const storedCompany = getStoredCompany(); const result = await submitOnline({ ...draft, companyId: storedCompany?.companyId || draft.companyId, companyCode: storedCompany?.code || draft.companyCode, checklistSections }); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return { ...result, syncStatus: SYNC_STATES.submitted }; } catch (error) { const message = readableError(error); await updateQueuedDraft({ syncStatus: SYNC_STATES.failed, lastSyncError: message }); writeSyncMeta({ state: SYNC_STATES.failed, pending: true, lastError: message }); throw new Error(message); } }
++export async function submitInspection({ allowQueue = true, ...input }) { const draft = { ...input, inspectionId: input.inspectionId || crypto.randomUUID() }; const queuedDraft = buildInspectionDraft({ ...draft, queued: true, syncStatus: SYNC_STATES.savedOnDevice }); const offline = typeof navigator !== "undefined" && !navigator.onLine; if (offline) { if (!allowQueue) throw new Error("The connection is still offline."); await saveInspectionDraft(queuedDraft); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: "Waiting for an internet connection." }); return { queued: true }; } try { writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); const result = await submitOnline(draft); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return result; } catch (error) { if (allowQueue && retryableError(error)) { const attempts = (draft.syncAttempts || 0) + 1; await saveInspectionDraft({ ...queuedDraft, syncAttempts: attempts, lastSyncError: readableError(error) }); await registerBackgroundSync(); writeSyncMeta({ state: SYNC_STATES.savedOnDevice, pending: true, lastError: readableError(error) }); return { queued: true }; } throw new Error(readableError(error)); } }
++export async function syncQueuedInspection({ checklistSections }) { if (typeof navigator !== "undefined" && !navigator.onLine) return null; const draft = await loadInspectionDraft(); if (!draft?.queued) return null; const attempts = (draft.syncAttempts || 0) + 1; await updateQueuedDraft({ syncStatus: SYNC_STATES.uploading, syncAttempts: attempts, lastSyncError: null }); writeSyncMeta({ state: SYNC_STATES.uploading, pending: true, lastError: null }); try { await updateQueuedDraft({ syncStatus: SYNC_STATES.syncing }); writeSyncMeta({ state: SYNC_STATES.syncing, pending: true }); const storedCompany = getStoredCompany(); const result = await submitOnline({ ...draft, companyId: storedCompany?.companyId || draft.companyId, companyCode: storedCompany?.code || draft.companyCode, checklistSections }); writeSyncMeta({ state: SYNC_STATES.submitted, pending: false, lastSyncAt: new Date().toISOString(), lastError: null }); return { ...result, syncStatus: SYNC_STATES.submitted }; } catch (error) { const message = readableError(error); await updateQueuedDraft({ syncStatus: SYNC_STATES.failed, lastSyncError: message }); writeSyncMeta({ state: SYNC_STATES.failed, pending: true, lastError: message }); throw new Error(message); } }
+diff --git a/client/src/lib/inspection-sync.test.ts b/client/src/lib/inspection-sync.test.ts
+index 26805a2..8d2b367 100644
+--- a/client/src/lib/inspection-sync.test.ts
++++ b/client/src/lib/inspection-sync.test.ts
+@@ -7,8 +7,12 @@ import {
+ 
+ vi.mock("./supabase", () => ({
+   supabase: null,
+-  driverSupabase: null,
+-  uploadInspectionPhoto: vi.fn(),
++  getStoredCompany: () => null,
++}));
++
++vi.mock("./api", () => ({
++  api: vi.fn(),
++  uploadDriverPhoto: vi.fn(),
+ }));
+ 
+ describe("inspection-sync", () => {
+@@ -51,7 +55,8 @@ describe("inspection-sync", () => {
+     expect(draft.checks).toEqual({ lights: true, brakes: false });
+   });
+ 
+-  it("queues an inspection when Supabase is unavailable", async () => {
++  it("queues an inspection when the device is offline", async () => {
++    vi.stubGlobal("navigator", { onLine: false });
+     const result = await submitInspection({
+       profile: { id: "driver-1", full_name: "Driver One" },
+       selectedFleet: "7100796",
+@@ -62,5 +67,6 @@ describe("inspection-sync", () => {
+     });
+ 
+     expect(result).toEqual({ queued: true });
++    vi.unstubAllGlobals();
+   });
+ });
+diff --git a/client/src/lib/supabase.ts b/client/src/lib/supabase.ts
+index e6f95fc..2c25c31 100644
+--- a/client/src/lib/supabase.ts
++++ b/client/src/lib/supabase.ts
+@@ -1,34 +1,23 @@
+-/* Field Ledger direction: backend wiring stays explicit and reversible so the field workflow remains usable during setup. */
++/*
++  Supabase is used for ONE thing only: sign-in for company admins (email + password, token refresh).
++
++  All fleet data, photos and reports go through the Cloudflare Worker API (see ./api.ts), which reads
++  D1 and R2 behind the Cloudflare edge cache. Nothing here queries tables, Storage or Edge Functions,
++  so Supabase database/storage egress stays at zero. The publishable key below is public by design.
++*/
+ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+ 
+ const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL as string | undefined) ?? "https://esbsguetydiqmaectoyu.supabase.co";
+ const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) ?? "sb_publishable_yQC3oOVE6IwXnexhTkQSXQ_5ZEC4BOi";
+-const r2ApiUrl = ((import.meta.env.VITE_R2_API_URL as string | undefined) ?? "https://rovaya-api.kamogeloralph.workers.dev").replace(/\/$/, "");
+ 
+ export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
+ 
+ export const supabase: SupabaseClient | null = isSupabaseConfigured
+-  ? createClient(supabaseUrl!, supabaseAnonKey!, {
++  ? createClient(supabaseUrl, supabaseAnonKey, {
+       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+     })
+   : null;
+ 
+-// The driver workflow is public and must always use the anon role. It must not
+-// restore a cached admin session from the same browser origin.
+-export const driverSupabase: SupabaseClient | null = isSupabaseConfigured
+-  ? createClient(supabaseUrl!, supabaseAnonKey!, {
+-      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+-    })
+-  : null;
+-
+-export type SupabaseInspectionPhoto = {
+-  id: string;
+-  inspection_id: string;
+-  photo_type: string;
+-  storage_path: string;
+-  captured_at: string;
+-};
+-
+ // A driver picks their company once (via an access code) and stays scoped to it on this device.
+ const COMPANY_STORAGE_KEY = "field-ledger-company";
+ export type StoredCompany = { code: string; companyId: string; companyName: string };
+@@ -48,91 +37,3 @@ export function setStoredCompany(company: StoredCompany | null) {
+   if (company) window.localStorage.setItem(COMPANY_STORAGE_KEY, JSON.stringify(company));
+   else window.localStorage.removeItem(COMPANY_STORAGE_KEY);
+ }
+-
+-export async function resolveCompanyCode(code: string): Promise<{ data: StoredCompany | null; error: Error | null }> {
+-  if (!driverSupabase) return { data: null, error: new Error("Supabase is not configured.") };
+-  const trimmed = code.trim();
+-  if (!trimmed) return { data: null, error: new Error("Enter your company access code.") };
+-  const { data, error } = await driverSupabase.rpc("resolve_company_code", { p_code: trimmed });
+-  if (error) return { data: null, error };
+-  const row = Array.isArray(data) ? data[0] : data;
+-  if (!row) return { data: null, error: new Error("That access code was not recognized.") };
+-  return { data: { code: trimmed, companyId: row.company_id as string, companyName: row.company_name as string }, error: null };
+-}
+-
+-export async function uploadInspectionPhoto(file: File, inspectionId: string, photoType: string, client: SupabaseClient | null = supabase) {
+-  if (!client) {
+-    return { data: null, error: new Error("Supabase is not configured yet.") };
+-  }
+-
+-  const extension = file.name.split(".").pop() || "jpg";
+-  const storagePath = `${inspectionId}/${photoType}-${crypto.randomUUID()}.${extension}`;
+-  const { error } = await client.storage.from("inspection-photos").upload(storagePath, file, {
+-    cacheControl: "3600",
+-    upsert: false,
+-    contentType: file.type || "image/jpeg",
+-  });
+-
+-  return { data: { storagePath }, error };
+-}
+-
+-// Cloudflare R2 upload path. The object key is decided server-side by the
+-// get-r2-upload-url Edge Function (not here) — see that function for why:
+-// letting the client pick the key would let anyone with the public anon key
+-// request a presigned URL for an arbitrary path in the bucket.
+-export async function uploadInspectionPhotoToR2(file: File, inspectionId: string, photoType: string, client: SupabaseClient | null = supabase) {
+-  if (!client) {
+-    return { data: null, error: new Error("Supabase is not configured yet.") };
+-  }
+-
+-  const contentType = file.type || "image/jpeg";
+-  const { data: presign, error: presignError } = await client.functions.invoke("get-r2-upload-url", {
+-    body: { inspectionId, photoType, contentType },
+-  });
+-  if (presignError || !presign?.uploadUrl) {
+-    // supabase-js's default error message ("Edge Function returned a non-2xx status code")
+-    // hides the actual reason. FunctionsHttpError carries the real response on .context —
+-    // unwrap it so failures are diagnosable from the toast instead of only from the
+-    // Supabase dashboard's function logs.
+-    let detail = "Could not get an upload URL for this photo.";
+-    const context = (presignError as { context?: Response })?.context;
+-    if (context && typeof context.json === "function") {
+-      try {
+-        const body = await context.json();
+-        if (body?.error) detail = body.error;
+-      } catch { /* response body wasn't JSON — keep the generic message */ }
+-    }
+-    return { data: null, error: new Error(detail) };
+-  }
+-
+-  const uploadRes = await fetch(presign.uploadUrl, {
+-    method: "PUT",
+-    headers: { "Content-Type": contentType },
+-    body: file,
+-  });
+-  if (!uploadRes.ok) {
+-    return { data: null, error: new Error(`Photo upload to storage failed (${uploadRes.status}).`) };
+-  }
+-
+-  return { data: { storagePath: presign.objectKey as string }, error: null };
+-}
+-
+-export async function deleteR2InspectionPhoto(photoId: string, storagePath: string, client: SupabaseClient | null = supabase) {
+-  if (!client) return { error: new Error("Supabase is not configured yet.") };
+-  const { data: sessionData, error: sessionError } = await client.auth.getSession();
+-  if (sessionError) return { error: sessionError };
+-  const accessToken = sessionData.session?.access_token;
+-  if (!accessToken) return { error: new Error("Your admin session has expired. Please sign in again.") };
+-  try {
+-    const response = await fetch(`${r2ApiUrl}/api/r2/photo/delete`, {
+-      method: "POST",
+-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+-      body: JSON.stringify({ photoId, storagePath }),
+-    });
+-    const body = await response.json().catch(() => ({}));
+-    if (!response.ok) return { error: new Error(body.error || `R2 deletion failed (${response.status}).`) };
+-    return { error: null };
+-  } catch {
+-    return { error: new Error("Could not reach the Cloudflare storage service.") };
+-  }
+-}
+diff --git a/client/src/pages/Admin.tsx b/client/src/pages/Admin.tsx
+index 53cfce2..a6df2a8 100644
+--- a/client/src/pages/Admin.tsx
++++ b/client/src/pages/Admin.tsx
+@@ -5,7 +5,7 @@ import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recha
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { cn } from "@/lib/utils";
+-import { supabase } from "@/lib/supabase";
++import { adminApi } from "@/lib/api";
+ import { type FleetRole, useFleetAuth } from "@/contexts/FleetAuthContext";
+ import Login from "@/pages/Login";
+ import AdminPhotoLibrary from "@/pages/AdminPhotoLibrary";
+@@ -79,80 +79,86 @@ function AdminWorkspace() {
+   const [companyForm, setCompanyForm] = useState({ name: "" });
+   const [editingTruckId, setEditingTruckId] = useState<string | null>(null); const [fleetFilter, setFleetFilter] = useState(""); const [openFleet, setOpenFleet] = useState(false); const [openAdmins, setOpenAdmins] = useState(false); const [openMissed, setOpenMissed] = useState(false); const [openCard, setOpenCard] = useState<"admin" | "truck" | "company" | null>(null); const [reportDate, setReportDate] = useState(() => new Date().toISOString().slice(0, 10)); const [selectedPhoto, setSelectedPhoto] = useState<SelectedPhoto | null>(null); const [expandedReportIds, setExpandedReportIds] = useState<Set<string>>(new Set()); const toggleReportRow = (id: string) => setExpandedReportIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+ 
++  // All data comes from the Cloudflare Worker API (D1 + R2 behind the edge cache); Supabase is only used to sign in.
++  const errMsg = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
+   const loadCompanies = async () => {
+-    if (!supabase) return;
+-    const { data, error } = await supabase.from("companies").select("id, name, active, photo_retention_days").order("name");
+-    if (error) return toastError(error.message);
+-    const list = (data ?? []) as AdminCompany[]; setCompanies(list);
+-    setSelectedCompanyId((current) => current ?? (isSuperAdmin ? list[0]?.id ?? null : profile?.company_id ?? null));
++    try {
++      const list = await adminApi.get<AdminCompany[]>("companies"); setCompanies(list);
++      setSelectedCompanyId((current) => current ?? (isSuperAdmin ? list[0]?.id ?? null : profile?.company_id ?? null));
++    } catch (error) { toastError(errMsg(error, "Unable to load companies.")); }
+   };
+ 
+   const load = async () => {
+-    if (!supabase || !selectedCompanyId) { setLoading(false); return; } const client = supabase; setLoading(true);
+-    const [{ data: truckData, error: truckError }, { data: adminData, error: adminError }, { data: reportData, error: reportError }] = await Promise.all([
+-      supabase.from("trucks").select("id, fleet_number, registration, truck_type, model, size, status, license_disc_expiry, roadworthy_expiry, insurance_expiry, next_service_km").eq("company_id", selectedCompanyId).order("fleet_number"),
+-      supabase.from("drivers").select("id, auth_user_id, employee_number, full_name, phone, role, company_id, active").eq("company_id", selectedCompanyId).order("full_name"),
+-      supabase.from("daily_inspections").select("id, inspection_date, started_at, submitted_at, status, notes, driver_name, employee_number, opening_kilometers, shift, truck:trucks(fleet_number, registration, model), answers:inspection_answers(result, checklist_item:checklist_items(prompt, section_title, sort_order)), photos:inspection_photos(id, photo_type, storage_path, captured_at)").eq("inspection_date", reportDate).eq("company_id", selectedCompanyId).order("created_at", { ascending: false }),
++    if (!selectedCompanyId) { setLoading(false); return; } setLoading(true);
++    const companyQuery = `companyId=${encodeURIComponent(selectedCompanyId)}`;
++    const [truckResult, adminResult, reportResult] = await Promise.allSettled([
++      adminApi.get<AdminTruck[]>(`trucks?${companyQuery}`),
++      adminApi.get<AdminAccount[]>(`drivers?${companyQuery}`),
++      adminApi.get<ReportRow[]>(`reports?${companyQuery}&date=${reportDate}`),
+     ]);
+-    if (truckError || adminError || reportError) toastError((truckError || adminError || reportError)?.message || "Unable to load admin data.");
+-    setTrucks((truckData ?? []) as AdminTruck[]); setAdmins((adminData ?? []) as AdminAccount[]);
+-    const rows = (reportData ?? []) as unknown as ReportRow[];
+-    // Sign each inspection's own photos in place so every fleet's evidence set (selfie + six angles) stays grouped together.
+-    const withSignedPhotos = await Promise.all(rows.map(async (row) => {
+-      const photos = await Promise.all((row.photos ?? []).map(async (photo) => { const result = await client.storage.from("inspection-photos").createSignedUrl(photo.storage_path, 3600); return { ...photo, url: result.data?.signedUrl }; }));
+-      return { ...row, photos };
+-    }));
+-    setReports(withSignedPhotos); setExpandedReportIds(new Set()); setLoading(false);
++    const failed = [truckResult, adminResult, reportResult].find((result) => result.status === "rejected") as PromiseRejectedResult | undefined;
++    if (failed) toastError(errMsg(failed.reason, "Unable to load admin data."));
++    setTrucks(truckResult.status === "fulfilled" ? truckResult.value : []); setAdmins(adminResult.status === "fulfilled" ? adminResult.value : []);
++    // Photo links arrive already signed by the Worker, so evidence sets stay grouped per inspection with no extra requests.
++    setReports(reportResult.status === "fulfilled" ? reportResult.value : []); setExpandedReportIds(new Set()); setLoading(false);
+   };
+   const logAudit = async (entityType: string, entityId: string, action: string, metadata: Record<string, unknown> = {}) => {
+-    if (!supabase || !profile?.id) return;
+-    await supabase.from("audit_events").insert({ actor_id: profile.id, entity_type: entityType, entity_id: entityId, action, metadata, company_id: selectedCompanyId });
++    if (!profile?.id || !selectedCompanyId) return;
++    try { await adminApi.post("audit", { companyId: selectedCompanyId, entity_type: entityType, entity_id: entityId, action, metadata }); } catch { /* the audit trail must never block the action itself */ }
+   };
+   const loadDefects = async () => {
+-    if (!supabase || !selectedCompanyId) return;
+-    const { data, error } = await supabase.from("defects").select("id, category, severity, title, description, status, created_at, resolved_at, inspection:daily_inspections!inner(inspection_date, driver_name, company_id, truck:trucks(fleet_number, registration))").eq("inspection.company_id", selectedCompanyId).order("created_at", { ascending: false });
+-    if (error) return toastError(error.message);
+-    setDefects((data ?? []) as unknown as AdminDefect[]);
++    if (!selectedCompanyId) return;
++    try { setDefects(await adminApi.get<AdminDefect[]>(`defects?companyId=${encodeURIComponent(selectedCompanyId)}`)); } catch (error) { toastError(errMsg(error, "Unable to load defects.")); }
+   };
+   const updateDefectStatus = async (defect: AdminDefect, status: AdminDefect["status"]) => {
+-    if (!supabase) return;
+-    const payload: Record<string, unknown> = { status };
+-    payload.resolved_by = status === "resolved" ? profile?.id ?? null : null;
+-    payload.resolved_at = status === "resolved" ? new Date().toISOString() : null;
+-    const { error } = await supabase.from("defects").update(payload).eq("id", defect.id);
+-    if (error) return toastError(error.message);
++    try { await adminApi.patch(`defects/${defect.id}`, { status }); } catch (error) { return toastError(errMsg(error, "Unable to update the defect.")); }
+     await logAudit("defect", defect.id, `status → ${status}`, { title: defect.title });
+     toastSuccess("Defect updated.");
+     await loadDefects();
+   };
+   const loadAuditEvents = async () => {
+-    if (!supabase || !selectedCompanyId) return;
+-    const { data, error } = await supabase.from("audit_events").select("id, entity_type, entity_id, action, metadata, created_at").eq("company_id", selectedCompanyId).order("created_at", { ascending: false }).limit(100);
+-    if (error) return toastError(error.message);
+-    setAuditEvents((data ?? []) as AuditEvent[]);
++    if (!selectedCompanyId) return;
++    try { setAuditEvents(await adminApi.get<AuditEvent[]>(`audit?companyId=${encodeURIComponent(selectedCompanyId)}`)); } catch (error) { toastError(errMsg(error, "Unable to load the audit trail.")); }
+   };
+   useEffect(() => { void loadCompanies(); }, []);
+   useEffect(() => { void load(); void loadDefects(); void loadAuditEvents(); }, [reportDate, selectedCompanyId]);
+ 
+   const createCompany = async (event: React.FormEvent) => {
+-    event.preventDefault(); if (!supabase) return;
++    event.preventDefault();
+     const name = companyForm.name.trim(); if (!name) return toastError("Company name is required.");
+-    const slug = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Math.random().toString(36).slice(2, 6)}`;
+-    const { data: company, error } = await supabase.from("companies").insert({ name, slug }).select("id").single();
+-    if (error || !company) return toastError(error?.message || "Unable to create company.");
+-    const code = `${name.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 8)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+-    const { error: codeError } = await supabase.from("company_access_codes").insert({ company_id: company.id, code });
+-    if (codeError) return toastError(codeError.message);
+-    const { error: templateError } = await supabase.from("checklist_templates").insert({ company_id: company.id, title: `${name} checklist v1`, version: 1, active: true });
+-    if (templateError) return toastError(templateError.message);
+-    toastSuccess(`${name} created. Driver access code: ${code}`);
+-    setCompanyForm({ name: "" }); setOpenCard(null); setSelectedCompanyId(company.id); await loadCompanies();
++    try {
++      const company = await adminApi.post<{ id: string; name: string; code: string }>("companies", { name });
++      toastSuccess(`${name} created. Driver access code: ${company.code}`);
++      setCompanyForm({ name: "" }); setOpenCard(null); setSelectedCompanyId(company.id); await loadCompanies();
++    } catch (error) { toastError(errMsg(error, "Unable to create company.")); }
+   };
+ 
+-  const saveTruck = async (event: React.FormEvent) => { event.preventDefault(); if (!supabase || !selectedCompanyId) return; const payload = { fleet_number: formatFleetNumber(truckForm.fleet_number), registration: truckForm.registration.trim().toUpperCase(), truck_type: truckForm.truck_type.trim() || null, model: truckForm.model.trim() || null, size: truckForm.size.trim() || null, status: truckForm.status, company_id: selectedCompanyId, license_disc_expiry: truckForm.license_disc_expiry || null, roadworthy_expiry: truckForm.roadworthy_expiry || null, insurance_expiry: truckForm.insurance_expiry || null, next_service_km: truckForm.next_service_km === "" ? null : Number(truckForm.next_service_km) }; if (!payload.fleet_number || !payload.registration) return toastError("Fleet number and registration are required."); const result = editingTruckId ? await supabase.from("trucks").update(payload).eq("id", editingTruckId) : await supabase.from("trucks").insert(payload); if (result.error) return toastError(result.error.message); await logAudit("truck", editingTruckId ?? payload.fleet_number, editingTruckId ? "updated" : "created", { fleet_number: payload.fleet_number }); toastSuccess(editingTruckId ? "Vehicle updated." : "Vehicle added."); setTruckForm({ fleet_number: "", registration: "", truck_type: "", model: "", size: "", status: "ready", license_disc_expiry: "", roadworthy_expiry: "", insurance_expiry: "", next_service_km: "" }); setEditingTruckId(null); setOpenCard(null); await load(); };
+-  const saveAdmin = async (event: React.FormEvent) => { event.preventDefault(); if (!supabase || !selectedCompanyId) return; const payload = { auth_user_id: adminForm.auth_user_id.trim() || null, employee_number: adminForm.employee_number.trim() || null, full_name: adminForm.full_name.trim(), phone: adminForm.phone.trim() || null, role: "admin" as FleetRole, company_id: selectedCompanyId, active: true }; if (!payload.full_name) return toastError("Name is required."); const { error } = await supabase.from("drivers").insert(payload); if (error) return toastError(error.message); toastSuccess("Company admin added."); setAdminForm({ auth_user_id: "", employee_number: "", full_name: "", phone: "" }); setOpenCard(null); await load(); };
+-  const deleteTruck = async (truck: AdminTruck) => { if (!supabase || !window.confirm(`Delete fleet ${truck.fleet_number}? This cannot be undone.`)) return; const { error } = await supabase.from("trucks").delete().eq("id", truck.id); if (error) return toastError(error.message); await logAudit("truck", truck.id, "deleted", { fleet_number: truck.fleet_number, registration: truck.registration }); toastSuccess("Vehicle deleted."); await load(); };
+-  const deleteAdmin = async (admin: AdminAccount) => { if (!supabase || !window.confirm(`Remove ${admin.full_name}'s admin access?`)) return; const { error } = await supabase.from("drivers").delete().eq("id", admin.id); if (error) return toastError(error.message); await logAudit("admin", admin.id, "removed", { full_name: admin.full_name }); toastSuccess("Admin access removed."); await load(); };
++  const saveTruck = async (event: React.FormEvent) => {
++    event.preventDefault(); if (!selectedCompanyId) return;
++    const payload = { id: editingTruckId ?? undefined, companyId: selectedCompanyId, fleet_number: formatFleetNumber(truckForm.fleet_number), registration: truckForm.registration.trim().toUpperCase(), truck_type: truckForm.truck_type.trim() || null, model: truckForm.model.trim() || null, size: truckForm.size.trim() || null, status: truckForm.status, license_disc_expiry: truckForm.license_disc_expiry || null, roadworthy_expiry: truckForm.roadworthy_expiry || null, insurance_expiry: truckForm.insurance_expiry || null, next_service_km: truckForm.next_service_km === "" ? null : Number(truckForm.next_service_km) };
++    if (!payload.fleet_number || !payload.registration) return toastError("Fleet number and registration are required.");
++    try { await adminApi.post("trucks", payload); } catch (error) { return toastError(errMsg(error, "Unable to save the vehicle.")); }
++    await logAudit("truck", editingTruckId ?? payload.fleet_number, editingTruckId ? "updated" : "created", { fleet_number: payload.fleet_number });
++    toastSuccess(editingTruckId ? "Vehicle updated." : "Vehicle added.");
++    setTruckForm({ fleet_number: "", registration: "", truck_type: "", model: "", size: "", status: "ready", license_disc_expiry: "", roadworthy_expiry: "", insurance_expiry: "", next_service_km: "" }); setEditingTruckId(null); setOpenCard(null); await load();
++  };
++  const saveAdmin = async (event: React.FormEvent) => {
++    event.preventDefault(); if (!selectedCompanyId) return;
++    const payload = { companyId: selectedCompanyId, auth_user_id: adminForm.auth_user_id.trim() || null, employee_number: adminForm.employee_number.trim() || null, full_name: adminForm.full_name.trim(), phone: adminForm.phone.trim() || null };
++    if (!payload.full_name) return toastError("Name is required.");
++    try { await adminApi.post("drivers", payload); } catch (error) { return toastError(errMsg(error, "Unable to add the admin.")); }
++    toastSuccess("Company admin added."); setAdminForm({ auth_user_id: "", employee_number: "", full_name: "", phone: "" }); setOpenCard(null); await load();
++  };
++  const deleteTruck = async (truck: AdminTruck) => {
++    if (!window.confirm(`Delete fleet ${truck.fleet_number}? This cannot be undone.`)) return;
++    try { await adminApi.delete(`trucks/${truck.id}`); } catch (error) { return toastError(errMsg(error, "Unable to delete the vehicle.")); }
++    await logAudit("truck", truck.id, "deleted", { fleet_number: truck.fleet_number, registration: truck.registration }); toastSuccess("Vehicle deleted."); await load();
++  };
++  const deleteAdmin = async (admin: AdminAccount) => {
++    if (!window.confirm(`Remove ${admin.full_name}'s admin access?`)) return;
++    try { await adminApi.delete(`drivers/${admin.id}`); } catch (error) { return toastError(errMsg(error, "Unable to remove the admin.")); }
++    await logAudit("admin", admin.id, "removed", { full_name: admin.full_name }); toastSuccess("Admin access removed."); await load();
++  };
+   const exportFleet = () => { const rows = [["Fleet number", "Registration", "Vehicle type", "Model", "Size", "Status"], ...trucks.map((t) => [t.fleet_number, t.registration, t.truck_type ?? "", t.model ?? "", t.size ?? "", t.status])]; const csv = rows.map((row) => row.map((v) => `"${String(v).replaceAll('"', '""')}"`).join(",")).join("\n"); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); link.download = `${(companies.find((c) => c.id === selectedCompanyId)?.name || "rovaya").toLowerCase().replace(/[^a-z0-9]+/g, "-")}-fleet-${reportDate}.csv`; link.click(); };
+   const filteredReports = reports.filter((row) => !fleetFilter || row.truck?.fleet_number?.toLowerCase().includes(fleetFilter.toLowerCase()));
+   const selectedCompany = companies.find((c) => c.id === selectedCompanyId) ?? null;
+diff --git a/client/src/pages/AdminPhotoLibrary.tsx b/client/src/pages/AdminPhotoLibrary.tsx
+index c2c7557..5e28a20 100644
+--- a/client/src/pages/AdminPhotoLibrary.tsx
++++ b/client/src/pages/AdminPhotoLibrary.tsx
+@@ -4,7 +4,7 @@ import { toast } from "sonner";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { cn } from "@/lib/utils";
+-import { deleteR2InspectionPhoto, supabase } from "@/lib/supabase";
++import { adminApi } from "@/lib/api";
+ 
+ type FleetOption = { fleet_number: string; registration: string };
+ type CompanyInfo = { id: string; name: string; photo_retention_days: number | null };
+@@ -45,35 +45,19 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
+   }, [company?.id, company?.photo_retention_days]);
+ 
+   const search = async () => {
+-    if (!supabase || !selectedCompanyId) return;
++    if (!selectedCompanyId) return;
+     setLoading(true); setSearched(true);
+-    const client = supabase;
+-    let inspectionQuery = client.from("daily_inspections").select("id, inspection_date, driver_name, truck:trucks(fleet_number, registration)").eq("company_id", selectedCompanyId).order("inspection_date", { ascending: false }).limit(300);
+-    if (date) inspectionQuery = inspectionQuery.eq("inspection_date", date);
+-    const { data: inspectionRows, error: inspectionError } = await inspectionQuery;
+-    if (inspectionError) { toast.error(inspectionError.message); setLoading(false); return; }
+-    const matching = ((inspectionRows ?? []) as any[]).filter((row) => !fleet || row.truck?.fleet_number === fleet);
+-    const inspectionIds = matching.map((row) => row.id);
+-    if (inspectionIds.length === 0) { setPhotos([]); setSelectedIds(new Set()); setLoading(false); return; }
+-    const { data: photoRows, error: photoError } = await client.from("inspection_photos").select("id, inspection_id, photo_type, storage_path, storage_provider, captured_at").in("inspection_id", inspectionIds).order("captured_at", { ascending: false });
+-    if (photoError) { toast.error(photoError.message); setLoading(false); return; }
+-    const inspectionById = new Map(matching.map((row) => [row.id, row]));
+-    const withUrls = await Promise.all(((photoRows ?? []) as any[]).map(async (photo): Promise<LibraryPhoto> => {
+-      const inspection = inspectionById.get(photo.inspection_id);
+-      // R2-backed photos (storage_provider === "r2") go through the get-r2-photo-url Edge
+-      // Function instead of createSignedUrl, since that bucket isn't Supabase Storage —
+-      // see supabase/functions/get-r2-photo-url/index.ts for the access-control story.
+-      const signedUrl = photo.storage_provider === "r2"
+-        ? (await client.functions.invoke("get-r2-photo-url", { body: { storagePath: photo.storage_path } })).data?.signedUrl
+-        : (await client.storage.from("inspection-photos").createSignedUrl(photo.storage_path, 3600)).data?.signedUrl;
+-      return {
+-        id: photo.id, inspection_id: photo.inspection_id, photo_type: photo.photo_type, storage_path: photo.storage_path, storage_provider: photo.storage_provider, captured_at: photo.captured_at,
+-        url: signedUrl,
+-        fleet_number: inspection?.truck?.fleet_number || "Unknown", registration: inspection?.truck?.registration || "",
+-        driver_name: inspection?.driver_name || null, inspection_date: inspection?.inspection_date || "",
+-      };
+-    }));
+-    setPhotos(withUrls); setSelectedIds(new Set()); setLoading(false);
++    try {
++      // One request: the Worker finds matching inspections, their photos, and returns ready-to-use signed links
++      // (served from R2 through the Cloudflare CDN cache, never from Supabase).
++      const query = new URLSearchParams({ companyId: selectedCompanyId, date, fleet });
++      const rows = await adminApi.get<LibraryPhoto[]>(`photos?${query.toString()}`);
++      setPhotos(rows); setSelectedIds(new Set());
++    } catch (error) {
++      toast.error(error instanceof Error ? error.message : "Unable to load photos.");
++    } finally {
++      setLoading(false);
++    }
+   };
+ 
+   const toggleSelected = (id: string) => setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+@@ -82,22 +66,11 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
+   const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
+ 
+   const deletePhotos = async (targets: LibraryPhoto[]) => {
+-    if (!supabase || targets.length === 0) return;
+-    const deletable = targets.filter((p) => p.storage_provider !== "r2");
+-    const r2Targets = targets.filter((p) => p.storage_provider === "r2");
++    if (targets.length === 0) return;
+     if (!window.confirm(`Delete ${targets.length} photo${targets.length === 1 ? "" : "s"}? This cannot be undone.`)) return;
+     setDeleting(true);
+     try {
+-      for (const photo of r2Targets) {
+-        const result = await deleteR2InspectionPhoto(photo.id, photo.storage_path, supabase);
+-        if (result.error) throw result.error;
+-      }
+-      if (deletable.length > 0) {
+-        const { error: storageError } = await supabase.storage.from("inspection-photos").remove(deletable.map((p) => p.storage_path));
+-        if (storageError) throw storageError;
+-        const { error: rowError } = await supabase.from("inspection_photos").delete().in("id", deletable.map((p) => p.id));
+-        if (rowError) throw rowError;
+-      }
++      await adminApi.post("photos/delete", { ids: targets.map((p) => p.id) });
+       const deletedIds = new Set(targets.map((p) => p.id));
+       await onAudit?.("photo", targets.map((p) => p.id).join(","), "deleted", { count: targets.length, fleet: targets[0]?.fleet_number });
+       toast.success(`${targets.length} photo${targets.length === 1 ? "" : "s"} deleted.`);
+@@ -147,7 +120,7 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
+   };
+ 
+   const saveRetention = async () => {
+-    if (!supabase || !selectedCompanyId) return;
++    if (!selectedCompanyId) return;
+     const trimmed = retentionInput.trim();
+     let value: number | null = null;
+     if (trimmed !== "") {
+@@ -156,9 +129,9 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
+       value = parsed;
+     }
+     setSavingRetention(true);
+-    const { error } = await supabase.from("companies").update({ photo_retention_days: value }).eq("id", selectedCompanyId);
++    try { await adminApi.patch(`companies/${selectedCompanyId}`, { photo_retention_days: value }); }
++    catch (error) { setSavingRetention(false); return toast.error(error instanceof Error ? error.message : "Unable to save the retention period."); }
+     setSavingRetention(false);
+-    if (error) return toast.error(error.message);
+     await onAudit?.("company", selectedCompanyId, "retention_changed", { photo_retention_days: value });
+     toast.success(value ? `Evidence photos will auto-delete ${value} days after capture.` : "Automatic photo deletion turned off.");
+     await onRetentionSaved();
+@@ -251,7 +224,7 @@ export default function AdminPhotoLibrary({ selectedCompanyId, company, fleetOpt
+               <span className="text-xs text-[#718070]">days</span>
+               <Button type="button" onClick={() => void saveRetention()} disabled={savingRetention} className="h-10 rounded-xl bg-[#2f4638] px-5 text-xs font-bold text-white disabled:opacity-60">{savingRetention ? "Saving…" : "Save"}</Button>
+             </div>
+-            <p className="mt-2 text-[11px] text-[#a2aa9f]">Enforced by a nightly cleanup job on the database — requires the <code>16_evidence_photo_retention.sql</code> migration to be applied once in Supabase.</p>
++            <p className="mt-2 text-[11px] text-[#a2aa9f]">Enforced by a nightly Cloudflare job (03:00 SAST) that removes both the record and the stored file. Photos are kept 30 days when this is left blank.</p>
+           </div>
+         </div>
+       )}
+diff --git a/client/src/pages/Home.tsx b/client/src/pages/Home.tsx
+index af33124..637cf61 100644
+--- a/client/src/pages/Home.tsx
++++ b/client/src/pages/Home.tsx
+@@ -3,7 +3,8 @@ import { ArrowLeft, ArrowRight, Camera, Check, CheckCircle2, Cloud, Loader2, Rot
+ import { toast } from "sonner";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+-import { driverSupabase, getStoredCompany, isSupabaseConfigured, resolveCompanyCode, setStoredCompany, type StoredCompany } from "@/lib/supabase";
++import { getStoredCompany, setStoredCompany, type StoredCompany } from "@/lib/supabase";
++import { fetchBootstrap, resolveCompanyCode, type DriverBootstrap } from "@/lib/api";
+ import { buildInspectionDraft, clearInspectionDraft, getInspectionSyncState, loadInspectionDraft, saveInspectionDraft, submitInspection, syncQueuedInspection, SYNC_STATES } from "@/lib/inspection-sync.js";
+ import CameraCapture from "@/components/CameraCapture";
+ import { RovayaBrand } from "@/components/RovayaBrand";
+@@ -19,12 +20,8 @@ const photoSlots = [
+ 
+ type ChecklistSection = { id: string; number: string; title: string; note: string; items: { id: string; label: string; required: boolean }[] };
+ 
+-async function loadCompanyChecklist(companyId: string): Promise<ChecklistSection[]> {
+-  if (!driverSupabase) return [];
+-  const { data: template, error: templateError } = await driverSupabase.from("checklist_templates").select("id").eq("company_id", companyId).eq("active", true).order("version", { ascending: false }).limit(1).maybeSingle();
+-  if (templateError || !template) return [];
+-  const { data: items, error: itemError } = await driverSupabase.from("checklist_items").select("id, section_number, section_title, prompt, sort_order, required").eq("template_id", template.id).order("sort_order");
+-  if (itemError || !items) return [];
++// The checklist now arrives inside the single cached bootstrap response (Cloudflare edge + D1).
++function buildChecklistSections(items: DriverBootstrap["checklist"]["items"]): ChecklistSection[] {
+   const sections: ChecklistSection[] = [];
+   for (const item of items) {
+     const sectionKey = item.section_number || item.section_title || "general";
+@@ -154,23 +151,25 @@ export default function Home() {
+ 
+   const changeCompany = () => { setStoredCompany(null); setCompany(null); setStarted(false); setStep("identity"); setSections([]); setFleetOptions([]); };
+ 
+-  const loadFleets = async (companyId: string) => {
+-    if (!driverSupabase) { setFleetLoadError("Supabase is not configured for fleet lookup."); return; }
+-    setFleetLoading(true);
+-    const { data, error } = await driverSupabase.from("trucks").select("fleet_number, registration").eq("company_id", companyId).order("fleet_number").limit(1000);
+-    if (error) setFleetLoadError(error.message);
+-    else { setFleetOptions((data ?? []) as { fleet_number: string; registration: string }[]); setFleetLoadError(null); }
+-    setFleetLoading(false);
+-  };
+-
+   useEffect(() => {
+     if (!company) return;
+-    void loadFleets(company.companyId);
+-    setChecklistLoading(true); setChecklistError(null);
+-    void loadCompanyChecklist(company.companyId).then((loaded) => {
+-      if (loaded.length === 0) setChecklistError("This company has no active checklist configured yet. Contact your fleet admin.");
+-      setSections(loaded); setChecklistLoading(false);
+-    });
++    let cancelled = false;
++    setFleetLoading(true); setChecklistLoading(true); setChecklistError(null);
++    fetchBootstrap(company.code)
++      .then((data) => {
++        if (cancelled) return;
++        setFleetOptions(data.trucks); setFleetLoadError(null);
++        const loaded = buildChecklistSections(data.checklist.items);
++        if (loaded.length === 0) setChecklistError("This company has no active checklist configured yet. Contact your fleet admin.");
++        setSections(loaded);
++      })
++      .catch((error: unknown) => {
++        if (cancelled) return;
++        const message = error instanceof Error ? error.message : "Unable to load your fleet list.";
++        setFleetLoadError(message); setChecklistError(message); setSections([]);
++      })
++      .finally(() => { if (!cancelled) { setFleetLoading(false); setChecklistLoading(false); } });
++    return () => { cancelled = true; };
+   }, [company]);
+ 
+   useEffect(() => {
+@@ -297,7 +296,7 @@ export default function Home() {
+ 
+   if (!company) return <CompanyGate onResolved={setCompany} />;
+   if (!started) return <DriverWelcome onStart={() => setStarted(true)} companyName={company.companyName} onChangeCompany={changeCompany} />;
+-  return <div className="min-h-screen bg-[#ede9dd] text-[#2e4335]"><header className="sticky top-0 z-20 border-b border-[#d8d3c5] bg-[#f7f3e9]/95 px-4 py-4 backdrop-blur sm:px-8"><div className="mx-auto flex max-w-5xl items-center justify-between"><div className="flex min-w-0 items-center gap-3"><button type="button" onClick={() => setStarted(false)} aria-label="Back to welcome screen" className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-[#d8d3c5] bg-[#fbf8ef] text-[#14532D] hover:bg-white"><ArrowLeft className="h-4 w-4" /></button><AppLogo /></div><div className="flex items-center gap-2"><button type="button" onClick={() => setConfirmingReset(true)} className="flex items-center gap-1.5 rounded-full border border-[#d8d3c5] bg-[#fbf8ef] px-3 py-2 text-xs font-bold text-[#6a7769] hover:bg-white"><RotateCcw className="h-3.5 w-3.5" />Reset</button><div className={`flex items-center gap-2 rounded-full px-3 py-2 text-xs font-bold ${syncState === SYNC_STATES.failed ? "bg-[#fff0dc] text-[#a54d1f]" : syncState === SYNC_STATES.submitted ? "bg-[#e5efe5] text-[#2f5b3f]" : "bg-[#eef0e8] text-[#617562]"}`}><Cloud className="h-3.5 w-3.5" />{syncLabel(syncState)}</div>{(hasQueuedDraft || syncState === SYNC_STATES.failed) && <button type="button" onClick={() => void syncNow()} disabled={syncState === SYNC_STATES.syncing || !online} className="flex items-center gap-1.5 rounded-full bg-[#2f4638] px-3 py-2 text-xs font-bold text-white disabled:opacity-50"><RefreshCw className={`h-3.5 w-3.5 ${syncState === SYNC_STATES.syncing ? "animate-spin" : ""}`} />Sync now</button>}<div className={`hidden items-center gap-2 rounded-full px-3 py-2 text-xs font-bold sm:flex ${online ? "bg-[#e5efe5] text-[#2f5b3f]" : "bg-[#fff0dc] text-[#a54d1f]"}`}>{online ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}{online ? "Online" : "Offline"}</div></div></div></header>{confirmingReset && <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4"><div className="w-full max-w-sm rounded-2xl border border-[#d8d3c5] bg-[#fbf8ef] p-6 shadow-[0_24px_60px_-24px_rgba(20,83,45,0.35)]"><h3 className="font-slab text-xl font-bold text-[#14532D]">Start a fresh inspection?</h3><p className="mt-2 text-sm leading-5 text-[#6d7a6d]">This clears your identity, checklist answers, and captured photos on this device. This can't be undone.</p><div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setConfirmingReset(false)} className="h-11 rounded-xl border border-[#d3cec0] bg-white px-4 text-sm font-bold text-[#2e4335]">Cancel</button><button type="button" onClick={resetInspection} className="h-11 rounded-xl bg-[#b0402a] px-4 text-sm font-bold text-white">Reset everything</button></div></div></div>}{showSignOff && <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4"><div className="w-full max-w-sm rounded-2xl border border-[#d8d3c5] bg-[#fbf8ef] p-6 shadow-[0_24px_60px_-24px_rgba(20,83,45,0.35)]"><h3 className="font-slab text-xl font-bold text-[#14532D]">Sign &amp; submit</h3><p className="mt-2 text-sm leading-5 text-[#6d7a6d]">Type your full name exactly as entered in step 1 to confirm this inspection is accurate and complete.</p><p className="mt-3 rounded-lg bg-white px-3 py-2 font-mono text-sm font-bold text-[#2e4335]">{fullName}</p><Input value={signOffInput} onChange={(event) => setSignOffInput(event.target.value)} autoFocus placeholder="Type your full name" className="mt-3 h-11 rounded-xl border-[#d3cec0] bg-white text-sm font-semibold" /><div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setShowSignOff(false)} className="h-11 rounded-xl border border-[#d3cec0] bg-white px-4 text-sm font-bold text-[#2e4335]">Cancel</button><button type="button" disabled={signOffInput.trim().toLowerCase() !== fullName.trim().toLowerCase() || saving} onClick={() => { setShowSignOff(false); void submit(); }} className="h-11 rounded-xl bg-[#e9682a] px-4 text-sm font-bold text-white disabled:opacity-40">Confirm &amp; submit</button></div></div></div>}<main className="mx-auto max-w-5xl px-4 py-6 pb-16 sm:px-8 sm:py-10"><section className="mb-6 rounded-2xl border border-[#d8d3c5] bg-[#f7f3e9] p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#788578]">Inspection Sync Center</p><p className="mt-1 text-sm font-bold text-[#2e4335]">{syncLabel(syncState)}{lastSyncAt ? ` · Last sync ${new Date(lastSyncAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</p>{syncError && <p className="mt-1 max-w-xl text-xs text-[#a54d1f]">{syncError}</p>}</div><div className="flex items-center gap-2"><span className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${hasQueuedDraft ? "bg-[#fff0dc] text-[#a54d1f]" : "bg-[#e5efe5] text-[#2f5b3f]"}`}>{hasQueuedDraft ? "1 pending inspection" : "No pending inspections"}</span>{hasQueuedDraft && <button type="button" onClick={() => void syncNow()} disabled={!online || syncState === SYNC_STATES.syncing} className="inline-flex items-center gap-1.5 rounded-lg bg-[#2f4638] px-3 py-2 text-xs font-bold text-white disabled:opacity-50"><RefreshCw className={`h-3.5 w-3.5 ${syncState === SYNC_STATES.syncing ? "animate-spin" : ""}`} />Sync now</button>}</div></div>{backgroundSyncSupported && <p className="mt-3 text-xs text-[#617562]">Automatic background sync is enabled on this device.</p>}{!backgroundSyncSupported && <p className="mt-3 text-xs text-[#617562]">This browser will retry automatically when the app is open or when you tap Sync now.</p>}{!online && <p className="mt-3 text-xs text-[#a54d1f]">Offline mode is active. Your work is stored securely on this device and will retry when connection returns.</p>}</section><div className="mb-6 flex items-end justify-between gap-4"><div><div className="mb-2 text-[11px] font-bold uppercase tracking-[0.18em] text-[#e9682a]">Daily safety record</div><h1 className="font-slab text-3xl font-bold tracking-[-0.04em] sm:text-5xl">Start an inspection.</h1><p className="mt-2 max-w-xl text-sm leading-6 text-[#6d7a6d]">Capture your identity, complete every check, and record all six evidence zones. Nothing can be submitted incomplete.</p></div><div className="hidden items-center gap-2 text-xs font-semibold text-[#708070] sm:flex"><Cloud className="h-4 w-4 text-[#e9682a]" />Autosaves every change</div></div><StepBar step={step} onStep={(nextStep) => { if (nextStep === "checklist" && !identityReady) return toast.error("Complete your name and selfie first."); if (nextStep === "evidence" && !checklistReady) return toast.error("Answer every checklist item first."); goToStep(nextStep); }} />{step === "identity" && <section className="paper-panel rounded-2xl border border-[#d8d3c5] p-5 sm:p-8"><div className="grid gap-8 md:grid-cols-[1fr_280px]"><div><div className="mb-2 text-[11px] font-bold uppercase tracking-[0.16em] text-[#6a7769]">01 / Your details</div><h2 className="font-slab text-2xl font-bold">Who is completing this record?</h2><p className="mt-2 text-sm leading-6 text-[#758275]">Enter your full names and surnames exactly as they should appear on the safety record.</p><label className="mt-6 block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Full names and surnames</label><Input value={fullName} onChange={(event) => setFullName(event.target.value)} autoComplete="name" placeholder="e.g. Thabo Kabelo Mokoena" className="mt-2 h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] text-base font-semibold" /><label className="mt-5 block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Employee number <span className="font-normal normal-case tracking-normal text-[#a2aa9f]">(optional)</span><Input value={employeeNumber} onChange={(event) => setEmployeeNumber(event.target.value)} autoComplete="off" placeholder="e.g. EMP-0231" className="mt-2 h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] text-base font-semibold" /></label><label className="relative mt-5 block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Fleet number<div className="relative mt-2"><Input value={fleetNumber} onFocus={() => { setFleetMenuOpen(true); if (fleetOptions.length === 0 && company) void loadFleets(company.companyId); }} onChange={(event) => { setFleetNumber(event.target.value); setFleetMenuOpen(true); }} onBlur={() => window.setTimeout(() => setFleetMenuOpen(false), 150)} autoComplete="off" inputMode="numeric" placeholder="Type to search fleet numbers" className="h-12 w-full rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-mono text-base font-bold" />{fleetMenuOpen && fleetOptions.length > 0 && <div className="absolute left-0 right-0 top-[calc(100%+0.35rem)] z-30 max-h-56 overflow-y-auto rounded-xl border border-[#d8d3c5] bg-white p-1 shadow-[0_18px_35px_-18px_rgba(20,83,45,0.5)]">{matchingFleets.length > 0 ? matchingFleets.map((fleet) => <button key={fleet.fleet_number} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => { setFleetNumber(fleet.fleet_number); setFleetMenuOpen(false); }} className="flex w-full items-center justify-between rounded-lg px-3 py-3 text-left hover:bg-[#f2f7ef]"><span className="font-mono text-sm font-bold text-[#14532D]">{fleet.fleet_number}</span><span className="text-xs text-[#6B7264]">{fleet.registration}</span></button>) : <p className="px-3 py-3 text-xs text-[#6B7264]">No matching fleet numbers.</p>}</div>}</div></label><div className="mt-5 grid gap-4 sm:grid-cols-2"><label className="block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Opening kilometers<Input value={openingKilometers} onChange={(event) => setOpeningKilometers(event.target.value.replace(/[^0-9]/g, ""))} inputMode="numeric" placeholder="e.g. 184520" className="mt-2 h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-mono text-base font-bold" /></label><label className="block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Shift<select value={shift} onChange={(event) => setShift(event.target.value as typeof shift)} className="mt-2 h-12 w-full rounded-xl border border-[#d3cec0] bg-[#fbf8ef] px-3 text-sm font-semibold text-[#2e4335]"><option value="">Select shift</option><option value="morning">Morning shift</option><option value="day">Day shift</option><option value="night">Night shift</option></select></label></div></div><div className="flex flex-col items-center justify-center rounded-2xl bg-[#f4f0e5] p-4"><div className="relative grid h-44 w-44 place-items-center overflow-hidden rounded-full border-4 border-[#d6e4d3] bg-[#e9eee8]">{selfiePreview ? <img src={selfiePreview} alt="Selfie preview" className="h-full w-full object-cover" /> : <Camera className="h-10 w-10 text-[#6e876e]" />}</div><label className="mt-4 w-full"><Button type="button" onClick={() => openCameraFor({ kind: "selfie" })} className="h-11 w-full rounded-xl bg-[#2f4638] font-bold text-white">{selfiePreview ? "Retake selfie" : "Take selfie"}</Button><input ref={selfieInputRef} id="selfie-input" type="file" accept="image/*" capture="user" onChange={captureSelfie} className="sr-only" /></label><p className="mt-2 text-center text-[11px] leading-4 text-[#829083]">A front-camera selfie is required.</p></div></div><div className="mt-8 flex justify-end"><Button onClick={next} className="h-12 rounded-xl bg-[#2f4638] px-6 font-bold text-white">Continue to checklist <ArrowRight className="ml-2 h-4 w-4" /></Button></div></section>}{step === "checklist" && <section><div className="mb-4 flex items-center justify-between gap-4"><div className="flex items-center gap-3"><RovayaBrand imageClassName="w-[9rem]" subtitle={null} /><div><div className="text-[11px] font-bold uppercase tracking-[0.14em] text-[#E8590C]">02 / Safety checklist</div><h2 className="mt-1 font-slab text-2xl font-bold text-[#14532D]">Answer every item.</h2></div></div><div className="rounded-full bg-[#e9f5ea] px-3 py-2 font-mono text-xs font-bold text-[#14532D]">{answeredCount} / {allItems.length}</div></div><div className="space-y-4">{checklistLoading ? <div className="paper-panel rounded-2xl border border-[#d8d3c5] p-8 text-center text-sm text-[#6d7a6d]">Loading {company.companyName}'s checklist…</div> : checklistError ? <div className="paper-panel rounded-2xl border border-[#f0b7a5] bg-[#fff1ec] p-8 text-center text-sm text-[#a33f2a]">{checklistError}</div> : sections.map((section) => <div key={section.id} className="paper-panel rounded-2xl border border-[#d8d3c5] p-4 sm:p-6"><div className="mb-4 flex items-center gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-[#2f4638] font-mono text-xs font-bold text-white">{section.number}</div><div><h3 className="font-slab text-xl font-bold">{section.title}</h3><p className="text-xs text-[#849083]">{section.note}</p></div></div><div className="divide-y divide-[#e5dfd3] border-t border-[#e5dfd3]">{section.items.map((item) => <div key={item.id} className="flex flex-col gap-3 py-4"><div className="flex flex-col gap-3 sm:flex-row sm:items-center"><div className="flex-1 text-sm font-semibold leading-5 text-[#445746]">{item.label}</div><div className="grid grid-cols-2 gap-2 sm:w-44"><button type="button" onClick={() => setCheck(item.id, true)} className={`rounded-xl border py-3 text-xs font-bold uppercase tracking-[0.1em] ${checks[item.id] === true ? "border-[#2f8b5e] bg-[#2f8b5e] text-white" : "border-[#b8c0b4] bg-[#fbf8ef] text-[#617562]"}`}>Yes</button><button type="button" onClick={() => setCheck(item.id, false)} className={`rounded-xl border py-3 text-xs font-bold uppercase tracking-[0.1em] ${checks[item.id] === false ? "border-[#b65323] bg-[#b65323] text-white" : "border-[#b8c0b4] bg-[#fbf8ef] text-[#617562]"}`}>No</button></div></div>{checks[item.id] === false && <div className="rounded-xl border border-[#f0b7a5] bg-[#fff6f3] p-3"><label className="text-[11px] font-bold uppercase tracking-[0.1em] text-[#a33f2a]">What's the issue?</label><textarea value={itemNotes[item.id] ?? ""} onChange={(event) => setItemNote(item.id, event.target.value)} rows={2} autoFocus placeholder="Describe the fault so it can be actioned…" className="mt-1.5 w-full resize-none rounded-lg border border-[#f0b7a5] bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-[#f0b7a5]" /></div>}</div>)}</div></div>)}</div><div className="mt-5 flex justify-between gap-3"><Button variant="outline" onClick={() => goToStep("identity")} className="h-11 rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-bold"><ArrowLeft className="mr-2 h-4 w-4" />Back</Button><Button onClick={next} className="h-11 rounded-xl bg-[#2f4638] px-5 font-bold text-white">Continue to evidence <ArrowRight className="ml-2 h-4 w-4" /></Button></div></section>}{step === "evidence" && <section><div className="mb-4 flex items-end justify-between"><div><div className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#6a7769]">03 / Evidence photos</div><h2 className="mt-1 font-slab text-2xl font-bold">Capture all six zones.</h2><p className="mt-2 text-sm text-[#758275]">Stay on this page while moving around the vehicle. Each zone saves immediately.</p></div><div className="rounded-full bg-[#e5efe5] px-3 py-2 font-mono text-xs font-bold text-[#2f5b3f]">{photoCount} / 6</div></div><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{photoSlots.map((slot) => <PhotoCapture key={slot.id} {...slot} preview={photos[slot.id]} onTap={() => openCameraFor({ kind: "evidence", id: slot.id })} inputRef={(el) => { evidenceInputRefs.current[slot.id] = el; }} onFallbackCapture={(event) => { const file = event.target.files?.[0]; event.target.value = ""; capturePhoto(slot.id, file); }} />)}</div><div className="paper-panel mt-4 rounded-2xl border border-[#d8d3c5] p-4"><label className="text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Notes or deviations <span className="font-normal normal-case tracking-normal text-[#a2aa9f]">(optional)</span></label><textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={3} className="mt-2 w-full resize-none rounded-xl border border-[#d3cec0] bg-[#fbf8ef] px-3 py-3 text-sm outline-none focus:ring-2 focus:ring-[#dfe9dc]" placeholder="Add context for any answer marked No…" /></div><div className="mt-5 flex flex-col-reverse justify-between gap-3 sm:flex-row"><Button variant="outline" onClick={() => goToStep("checklist")} className="h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-bold"><ArrowLeft className="mr-2 h-4 w-4" />Back to checklist</Button><Button disabled={saving} onClick={() => { if (!fullName.trim()) return toast.error("Enter your full name in step 1 first."); setSignOffInput(""); setShowSignOff(true); }} className="h-12 rounded-xl bg-[#e9682a] px-7 font-bold text-white shadow-[4px_4px_0_#c9a27e] hover:bg-[#d9571b]">{saving ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Saving inspection…</> : <><ShieldCheck className="mr-2 h-4 w-4" />Submit complete inspection</>}</Button></div></section>}<div className="mt-8 flex items-center justify-center gap-2 text-center text-xs text-[#879185]">{online ? <Cloud className="h-4 w-4 text-[#6ba377]" /> : <WifiOff className="h-4 w-4 text-[#e9682a]" />} {online ? "Your progress is saved and ready to sync." : "No internet required — photos and selfie are stored on this device."}</div></main><CameraCapture open={cameraTarget !== null} facingMode={cameraTarget?.kind === "selfie" ? "user" : "environment"} title={cameraTarget?.kind === "selfie" ? "Selfie" : photoSlots.find((slot) => slot.id === (cameraTarget as any)?.id)?.label ?? "Photo"} onCapture={handleCameraCapture} onCancel={() => setCameraTarget(null)} onUnavailable={handleCameraUnavailable} /></div>;
++  return <div className="min-h-screen bg-[#ede9dd] text-[#2e4335]"><header className="sticky top-0 z-20 border-b border-[#d8d3c5] bg-[#f7f3e9]/95 px-4 py-4 backdrop-blur sm:px-8"><div className="mx-auto flex max-w-5xl items-center justify-between"><div className="flex min-w-0 items-center gap-3"><button type="button" onClick={() => setStarted(false)} aria-label="Back to welcome screen" className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-[#d8d3c5] bg-[#fbf8ef] text-[#14532D] hover:bg-white"><ArrowLeft className="h-4 w-4" /></button><AppLogo /></div><div className="flex items-center gap-2"><button type="button" onClick={() => setConfirmingReset(true)} className="flex items-center gap-1.5 rounded-full border border-[#d8d3c5] bg-[#fbf8ef] px-3 py-2 text-xs font-bold text-[#6a7769] hover:bg-white"><RotateCcw className="h-3.5 w-3.5" />Reset</button><div className={`flex items-center gap-2 rounded-full px-3 py-2 text-xs font-bold ${syncState === SYNC_STATES.failed ? "bg-[#fff0dc] text-[#a54d1f]" : syncState === SYNC_STATES.submitted ? "bg-[#e5efe5] text-[#2f5b3f]" : "bg-[#eef0e8] text-[#617562]"}`}><Cloud className="h-3.5 w-3.5" />{syncLabel(syncState)}</div>{(hasQueuedDraft || syncState === SYNC_STATES.failed) && <button type="button" onClick={() => void syncNow()} disabled={syncState === SYNC_STATES.syncing || !online} className="flex items-center gap-1.5 rounded-full bg-[#2f4638] px-3 py-2 text-xs font-bold text-white disabled:opacity-50"><RefreshCw className={`h-3.5 w-3.5 ${syncState === SYNC_STATES.syncing ? "animate-spin" : ""}`} />Sync now</button>}<div className={`hidden items-center gap-2 rounded-full px-3 py-2 text-xs font-bold sm:flex ${online ? "bg-[#e5efe5] text-[#2f5b3f]" : "bg-[#fff0dc] text-[#a54d1f]"}`}>{online ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}{online ? "Online" : "Offline"}</div></div></div></header>{confirmingReset && <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4"><div className="w-full max-w-sm rounded-2xl border border-[#d8d3c5] bg-[#fbf8ef] p-6 shadow-[0_24px_60px_-24px_rgba(20,83,45,0.35)]"><h3 className="font-slab text-xl font-bold text-[#14532D]">Start a fresh inspection?</h3><p className="mt-2 text-sm leading-5 text-[#6d7a6d]">This clears your identity, checklist answers, and captured photos on this device. This can't be undone.</p><div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setConfirmingReset(false)} className="h-11 rounded-xl border border-[#d3cec0] bg-white px-4 text-sm font-bold text-[#2e4335]">Cancel</button><button type="button" onClick={resetInspection} className="h-11 rounded-xl bg-[#b0402a] px-4 text-sm font-bold text-white">Reset everything</button></div></div></div>}{showSignOff && <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4"><div className="w-full max-w-sm rounded-2xl border border-[#d8d3c5] bg-[#fbf8ef] p-6 shadow-[0_24px_60px_-24px_rgba(20,83,45,0.35)]"><h3 className="font-slab text-xl font-bold text-[#14532D]">Sign &amp; submit</h3><p className="mt-2 text-sm leading-5 text-[#6d7a6d]">Type your full name exactly as entered in step 1 to confirm this inspection is accurate and complete.</p><p className="mt-3 rounded-lg bg-white px-3 py-2 font-mono text-sm font-bold text-[#2e4335]">{fullName}</p><Input value={signOffInput} onChange={(event) => setSignOffInput(event.target.value)} autoFocus placeholder="Type your full name" className="mt-3 h-11 rounded-xl border-[#d3cec0] bg-white text-sm font-semibold" /><div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setShowSignOff(false)} className="h-11 rounded-xl border border-[#d3cec0] bg-white px-4 text-sm font-bold text-[#2e4335]">Cancel</button><button type="button" disabled={signOffInput.trim().toLowerCase() !== fullName.trim().toLowerCase() || saving} onClick={() => { setShowSignOff(false); void submit(); }} className="h-11 rounded-xl bg-[#e9682a] px-4 text-sm font-bold text-white disabled:opacity-40">Confirm &amp; submit</button></div></div></div>}<main className="mx-auto max-w-5xl px-4 py-6 pb-16 sm:px-8 sm:py-10"><section className="mb-6 rounded-2xl border border-[#d8d3c5] bg-[#f7f3e9] p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#788578]">Inspection Sync Center</p><p className="mt-1 text-sm font-bold text-[#2e4335]">{syncLabel(syncState)}{lastSyncAt ? ` · Last sync ${new Date(lastSyncAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</p>{syncError && <p className="mt-1 max-w-xl text-xs text-[#a54d1f]">{syncError}</p>}</div><div className="flex items-center gap-2"><span className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${hasQueuedDraft ? "bg-[#fff0dc] text-[#a54d1f]" : "bg-[#e5efe5] text-[#2f5b3f]"}`}>{hasQueuedDraft ? "1 pending inspection" : "No pending inspections"}</span>{hasQueuedDraft && <button type="button" onClick={() => void syncNow()} disabled={!online || syncState === SYNC_STATES.syncing} className="inline-flex items-center gap-1.5 rounded-lg bg-[#2f4638] px-3 py-2 text-xs font-bold text-white disabled:opacity-50"><RefreshCw className={`h-3.5 w-3.5 ${syncState === SYNC_STATES.syncing ? "animate-spin" : ""}`} />Sync now</button>}</div></div>{backgroundSyncSupported && <p className="mt-3 text-xs text-[#617562]">Automatic background sync is enabled on this device.</p>}{!backgroundSyncSupported && <p className="mt-3 text-xs text-[#617562]">This browser will retry automatically when the app is open or when you tap Sync now.</p>}{!online && <p className="mt-3 text-xs text-[#a54d1f]">Offline mode is active. Your work is stored securely on this device and will retry when connection returns.</p>}</section><div className="mb-6 flex items-end justify-between gap-4"><div><div className="mb-2 text-[11px] font-bold uppercase tracking-[0.18em] text-[#e9682a]">Daily safety record</div><h1 className="font-slab text-3xl font-bold tracking-[-0.04em] sm:text-5xl">Start an inspection.</h1><p className="mt-2 max-w-xl text-sm leading-6 text-[#6d7a6d]">Capture your identity, complete every check, and record all six evidence zones. Nothing can be submitted incomplete.</p></div><div className="hidden items-center gap-2 text-xs font-semibold text-[#708070] sm:flex"><Cloud className="h-4 w-4 text-[#e9682a]" />Autosaves every change</div></div><StepBar step={step} onStep={(nextStep) => { if (nextStep === "checklist" && !identityReady) return toast.error("Complete your name and selfie first."); if (nextStep === "evidence" && !checklistReady) return toast.error("Answer every checklist item first."); goToStep(nextStep); }} />{step === "identity" && <section className="paper-panel rounded-2xl border border-[#d8d3c5] p-5 sm:p-8"><div className="grid gap-8 md:grid-cols-[1fr_280px]"><div><div className="mb-2 text-[11px] font-bold uppercase tracking-[0.16em] text-[#6a7769]">01 / Your details</div><h2 className="font-slab text-2xl font-bold">Who is completing this record?</h2><p className="mt-2 text-sm leading-6 text-[#758275]">Enter your full names and surnames exactly as they should appear on the safety record.</p><label className="mt-6 block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Full names and surnames</label><Input value={fullName} onChange={(event) => setFullName(event.target.value)} autoComplete="name" placeholder="e.g. Thabo Kabelo Mokoena" className="mt-2 h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] text-base font-semibold" /><label className="mt-5 block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Employee number <span className="font-normal normal-case tracking-normal text-[#a2aa9f]">(optional)</span><Input value={employeeNumber} onChange={(event) => setEmployeeNumber(event.target.value)} autoComplete="off" placeholder="e.g. EMP-0231" className="mt-2 h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] text-base font-semibold" /></label><label className="relative mt-5 block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Fleet number<div className="relative mt-2"><Input value={fleetNumber} onFocus={() => { setFleetMenuOpen(true); if (fleetOptions.length === 0 && company) void fetchBootstrap(company.code).then((data) => { setFleetOptions(data.trucks); setFleetLoadError(null); }).catch(() => undefined); }} onChange={(event) => { setFleetNumber(event.target.value); setFleetMenuOpen(true); }} onBlur={() => window.setTimeout(() => setFleetMenuOpen(false), 150)} autoComplete="off" inputMode="numeric" placeholder="Type to search fleet numbers" className="h-12 w-full rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-mono text-base font-bold" />{fleetMenuOpen && fleetOptions.length > 0 && <div className="absolute left-0 right-0 top-[calc(100%+0.35rem)] z-30 max-h-56 overflow-y-auto rounded-xl border border-[#d8d3c5] bg-white p-1 shadow-[0_18px_35px_-18px_rgba(20,83,45,0.5)]">{matchingFleets.length > 0 ? matchingFleets.map((fleet) => <button key={fleet.fleet_number} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => { setFleetNumber(fleet.fleet_number); setFleetMenuOpen(false); }} className="flex w-full items-center justify-between rounded-lg px-3 py-3 text-left hover:bg-[#f2f7ef]"><span className="font-mono text-sm font-bold text-[#14532D]">{fleet.fleet_number}</span><span className="text-xs text-[#6B7264]">{fleet.registration}</span></button>) : <p className="px-3 py-3 text-xs text-[#6B7264]">No matching fleet numbers.</p>}</div>}</div></label><div className="mt-5 grid gap-4 sm:grid-cols-2"><label className="block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Opening kilometers<Input value={openingKilometers} onChange={(event) => setOpeningKilometers(event.target.value.replace(/[^0-9]/g, ""))} inputMode="numeric" placeholder="e.g. 184520" className="mt-2 h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-mono text-base font-bold" /></label><label className="block text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Shift<select value={shift} onChange={(event) => setShift(event.target.value as typeof shift)} className="mt-2 h-12 w-full rounded-xl border border-[#d3cec0] bg-[#fbf8ef] px-3 text-sm font-semibold text-[#2e4335]"><option value="">Select shift</option><option value="morning">Morning shift</option><option value="day">Day shift</option><option value="night">Night shift</option></select></label></div></div><div className="flex flex-col items-center justify-center rounded-2xl bg-[#f4f0e5] p-4"><div className="relative grid h-44 w-44 place-items-center overflow-hidden rounded-full border-4 border-[#d6e4d3] bg-[#e9eee8]">{selfiePreview ? <img src={selfiePreview} alt="Selfie preview" className="h-full w-full object-cover" /> : <Camera className="h-10 w-10 text-[#6e876e]" />}</div><label className="mt-4 w-full"><Button type="button" onClick={() => openCameraFor({ kind: "selfie" })} className="h-11 w-full rounded-xl bg-[#2f4638] font-bold text-white">{selfiePreview ? "Retake selfie" : "Take selfie"}</Button><input ref={selfieInputRef} id="selfie-input" type="file" accept="image/*" capture="user" onChange={captureSelfie} className="sr-only" /></label><p className="mt-2 text-center text-[11px] leading-4 text-[#829083]">A front-camera selfie is required.</p></div></div><div className="mt-8 flex justify-end"><Button onClick={next} className="h-12 rounded-xl bg-[#2f4638] px-6 font-bold text-white">Continue to checklist <ArrowRight className="ml-2 h-4 w-4" /></Button></div></section>}{step === "checklist" && <section><div className="mb-4 flex items-center justify-between gap-4"><div className="flex items-center gap-3"><RovayaBrand imageClassName="w-[9rem]" subtitle={null} /><div><div className="text-[11px] font-bold uppercase tracking-[0.14em] text-[#E8590C]">02 / Safety checklist</div><h2 className="mt-1 font-slab text-2xl font-bold text-[#14532D]">Answer every item.</h2></div></div><div className="rounded-full bg-[#e9f5ea] px-3 py-2 font-mono text-xs font-bold text-[#14532D]">{answeredCount} / {allItems.length}</div></div><div className="space-y-4">{checklistLoading ? <div className="paper-panel rounded-2xl border border-[#d8d3c5] p-8 text-center text-sm text-[#6d7a6d]">Loading {company.companyName}'s checklist…</div> : checklistError ? <div className="paper-panel rounded-2xl border border-[#f0b7a5] bg-[#fff1ec] p-8 text-center text-sm text-[#a33f2a]">{checklistError}</div> : sections.map((section) => <div key={section.id} className="paper-panel rounded-2xl border border-[#d8d3c5] p-4 sm:p-6"><div className="mb-4 flex items-center gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-[#2f4638] font-mono text-xs font-bold text-white">{section.number}</div><div><h3 className="font-slab text-xl font-bold">{section.title}</h3><p className="text-xs text-[#849083]">{section.note}</p></div></div><div className="divide-y divide-[#e5dfd3] border-t border-[#e5dfd3]">{section.items.map((item) => <div key={item.id} className="flex flex-col gap-3 py-4"><div className="flex flex-col gap-3 sm:flex-row sm:items-center"><div className="flex-1 text-sm font-semibold leading-5 text-[#445746]">{item.label}</div><div className="grid grid-cols-2 gap-2 sm:w-44"><button type="button" onClick={() => setCheck(item.id, true)} className={`rounded-xl border py-3 text-xs font-bold uppercase tracking-[0.1em] ${checks[item.id] === true ? "border-[#2f8b5e] bg-[#2f8b5e] text-white" : "border-[#b8c0b4] bg-[#fbf8ef] text-[#617562]"}`}>Yes</button><button type="button" onClick={() => setCheck(item.id, false)} className={`rounded-xl border py-3 text-xs font-bold uppercase tracking-[0.1em] ${checks[item.id] === false ? "border-[#b65323] bg-[#b65323] text-white" : "border-[#b8c0b4] bg-[#fbf8ef] text-[#617562]"}`}>No</button></div></div>{checks[item.id] === false && <div className="rounded-xl border border-[#f0b7a5] bg-[#fff6f3] p-3"><label className="text-[11px] font-bold uppercase tracking-[0.1em] text-[#a33f2a]">What's the issue?</label><textarea value={itemNotes[item.id] ?? ""} onChange={(event) => setItemNote(item.id, event.target.value)} rows={2} autoFocus placeholder="Describe the fault so it can be actioned…" className="mt-1.5 w-full resize-none rounded-lg border border-[#f0b7a5] bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-[#f0b7a5]" /></div>}</div>)}</div></div>)}</div><div className="mt-5 flex justify-between gap-3"><Button variant="outline" onClick={() => goToStep("identity")} className="h-11 rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-bold"><ArrowLeft className="mr-2 h-4 w-4" />Back</Button><Button onClick={next} className="h-11 rounded-xl bg-[#2f4638] px-5 font-bold text-white">Continue to evidence <ArrowRight className="ml-2 h-4 w-4" /></Button></div></section>}{step === "evidence" && <section><div className="mb-4 flex items-end justify-between"><div><div className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#6a7769]">03 / Evidence photos</div><h2 className="mt-1 font-slab text-2xl font-bold">Capture all six zones.</h2><p className="mt-2 text-sm text-[#758275]">Stay on this page while moving around the vehicle. Each zone saves immediately.</p></div><div className="rounded-full bg-[#e5efe5] px-3 py-2 font-mono text-xs font-bold text-[#2f5b3f]">{photoCount} / 6</div></div><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{photoSlots.map((slot) => <PhotoCapture key={slot.id} {...slot} preview={photos[slot.id]} onTap={() => openCameraFor({ kind: "evidence", id: slot.id })} inputRef={(el) => { evidenceInputRefs.current[slot.id] = el; }} onFallbackCapture={(event) => { const file = event.target.files?.[0]; event.target.value = ""; capturePhoto(slot.id, file); }} />)}</div><div className="paper-panel mt-4 rounded-2xl border border-[#d8d3c5] p-4"><label className="text-xs font-bold uppercase tracking-[0.12em] text-[#788578]">Notes or deviations <span className="font-normal normal-case tracking-normal text-[#a2aa9f]">(optional)</span></label><textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={3} className="mt-2 w-full resize-none rounded-xl border border-[#d3cec0] bg-[#fbf8ef] px-3 py-3 text-sm outline-none focus:ring-2 focus:ring-[#dfe9dc]" placeholder="Add context for any answer marked No…" /></div><div className="mt-5 flex flex-col-reverse justify-between gap-3 sm:flex-row"><Button variant="outline" onClick={() => goToStep("checklist")} className="h-12 rounded-xl border-[#d3cec0] bg-[#fbf8ef] font-bold"><ArrowLeft className="mr-2 h-4 w-4" />Back to checklist</Button><Button disabled={saving} onClick={() => { if (!fullName.trim()) return toast.error("Enter your full name in step 1 first."); setSignOffInput(""); setShowSignOff(true); }} className="h-12 rounded-xl bg-[#e9682a] px-7 font-bold text-white shadow-[4px_4px_0_#c9a27e] hover:bg-[#d9571b]">{saving ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Saving inspection…</> : <><ShieldCheck className="mr-2 h-4 w-4" />Submit complete inspection</>}</Button></div></section>}<div className="mt-8 flex items-center justify-center gap-2 text-center text-xs text-[#879185]">{online ? <Cloud className="h-4 w-4 text-[#6ba377]" /> : <WifiOff className="h-4 w-4 text-[#e9682a]" />} {online ? "Your progress is saved and ready to sync." : "No internet required — photos and selfie are stored on this device."}</div></main><CameraCapture open={cameraTarget !== null} facingMode={cameraTarget?.kind === "selfie" ? "user" : "environment"} title={cameraTarget?.kind === "selfie" ? "Selfie" : photoSlots.find((slot) => slot.id === (cameraTarget as any)?.id)?.label ?? "Photo"} onCapture={handleCameraCapture} onCancel={() => setCameraTarget(null)} onUnavailable={handleCameraUnavailable} /></div>;
+ }
+ 
+ void CheckCircle2; void RotateCcw;
+diff --git a/migrations/0001_init.sql b/migrations/0001_init.sql
+new file mode 100644
+index 0000000..78c2020
+--- /dev/null
++++ b/migrations/0001_init.sql
+@@ -0,0 +1,133 @@
++-- Rovaya D1 schema (SQLite). Mirrors the Supabase public schema.
++-- ids are UUID text, timestamps are ISO-8601 text (UTC), booleans are 0/1.
++CREATE TABLE IF NOT EXISTS companies (
++  id TEXT PRIMARY KEY,
++  name TEXT NOT NULL,
++  slug TEXT NOT NULL UNIQUE,
++  active INTEGER NOT NULL DEFAULT 1,
++  photo_retention_days INTEGER CHECK (photo_retention_days IS NULL OR photo_retention_days > 0),
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE TABLE IF NOT EXISTS company_access_codes (
++  id TEXT PRIMARY KEY,
++  company_id TEXT NOT NULL REFERENCES companies(id),
++  code TEXT NOT NULL UNIQUE,
++  active INTEGER NOT NULL DEFAULT 1,
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE TABLE IF NOT EXISTS drivers (
++  id TEXT PRIMARY KEY,
++  auth_user_id TEXT UNIQUE,
++  employee_number TEXT UNIQUE,
++  full_name TEXT NOT NULL,
++  phone TEXT,
++  role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin','super_admin')),
++  active INTEGER NOT NULL DEFAULT 1,
++  company_id TEXT REFERENCES companies(id),
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE TABLE IF NOT EXISTS trucks (
++  id TEXT PRIMARY KEY,
++  company_id TEXT NOT NULL REFERENCES companies(id),
++  fleet_number TEXT NOT NULL,
++  registration TEXT NOT NULL,
++  truck_type TEXT,
++  model TEXT,
++  size TEXT,
++  status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('ready','inspection_due','out_of_service')),
++  notes TEXT,
++  license_disc_expiry TEXT,
++  roadworthy_expiry TEXT,
++  insurance_expiry TEXT,
++  next_service_km INTEGER CHECK (next_service_km IS NULL OR next_service_km >= 0),
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  UNIQUE (fleet_number),
++  UNIQUE (registration)
++);
++CREATE INDEX IF NOT EXISTS idx_trucks_company ON trucks(company_id, fleet_number);
++CREATE TABLE IF NOT EXISTS checklist_templates (
++  id TEXT PRIMARY KEY,
++  company_id TEXT NOT NULL REFERENCES companies(id),
++  version INTEGER NOT NULL,
++  title TEXT NOT NULL,
++  active INTEGER NOT NULL DEFAULT 1,
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE INDEX IF NOT EXISTS idx_templates_company ON checklist_templates(company_id, active, version);
++CREATE TABLE IF NOT EXISTS checklist_items (
++  id TEXT PRIMARY KEY,
++  template_id TEXT NOT NULL REFERENCES checklist_templates(id),
++  section_number TEXT NOT NULL,
++  section_title TEXT NOT NULL,
++  prompt TEXT NOT NULL,
++  sort_order INTEGER NOT NULL,
++  required INTEGER NOT NULL DEFAULT 1
++);
++CREATE INDEX IF NOT EXISTS idx_items_template ON checklist_items(template_id, sort_order);
++CREATE TABLE IF NOT EXISTS daily_inspections (
++  id TEXT PRIMARY KEY,
++  company_id TEXT NOT NULL REFERENCES companies(id),
++  truck_id TEXT NOT NULL REFERENCES trucks(id),
++  driver_id TEXT REFERENCES drivers(id),
++  checklist_template_id TEXT NOT NULL REFERENCES checklist_templates(id),
++  inspection_date TEXT NOT NULL,
++  started_at TEXT,
++  submitted_at TEXT,
++  status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','completed','needs_review','rejected')),
++  notes TEXT,
++  signature_name TEXT,
++  driver_name TEXT,
++  employee_number TEXT,
++  opening_kilometers INTEGER CHECK (opening_kilometers IS NULL OR opening_kilometers >= 0),
++  shift TEXT CHECK (shift IS NULL OR lower(shift) IN ('morning','day','night')),
++  company_access_code TEXT,
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE INDEX IF NOT EXISTS idx_insp_company_date ON daily_inspections(company_id, inspection_date);
++CREATE INDEX IF NOT EXISTS idx_insp_truck ON daily_inspections(truck_id);
++CREATE TABLE IF NOT EXISTS inspection_answers (
++  id TEXT PRIMARY KEY,
++  inspection_id TEXT NOT NULL REFERENCES daily_inspections(id) ON DELETE CASCADE,
++  checklist_item_id TEXT NOT NULL REFERENCES checklist_items(id),
++  result TEXT NOT NULL CHECK (result IN ('pass','fail','not_applicable')),
++  comment TEXT,
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE INDEX IF NOT EXISTS idx_answers_inspection ON inspection_answers(inspection_id);
++CREATE TABLE IF NOT EXISTS inspection_photos (
++  id TEXT PRIMARY KEY,
++  inspection_id TEXT NOT NULL REFERENCES daily_inspections(id) ON DELETE CASCADE,
++  photo_type TEXT NOT NULL,
++  storage_path TEXT NOT NULL,
++  storage_provider TEXT NOT NULL DEFAULT 'r2',
++  captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE INDEX IF NOT EXISTS idx_photos_inspection ON inspection_photos(inspection_id);
++CREATE INDEX IF NOT EXISTS idx_photos_captured ON inspection_photos(captured_at);
++CREATE TABLE IF NOT EXISTS defects (
++  id TEXT PRIMARY KEY,
++  inspection_id TEXT NOT NULL REFERENCES daily_inspections(id) ON DELETE CASCADE,
++  category TEXT NOT NULL DEFAULT 'general',
++  severity TEXT NOT NULL DEFAULT 'medium' CHECK (severity IN ('low','medium','high','critical')),
++  title TEXT NOT NULL,
++  description TEXT,
++  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','in_progress','resolved','waived')),
++  reported_by TEXT REFERENCES drivers(id),
++  resolved_by TEXT REFERENCES drivers(id),
++  resolved_at TEXT,
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE INDEX IF NOT EXISTS idx_defects_inspection ON defects(inspection_id);
++CREATE TABLE IF NOT EXISTS audit_events (
++  id TEXT PRIMARY KEY,
++  company_id TEXT REFERENCES companies(id),
++  actor_id TEXT REFERENCES drivers(id),
++  entity_type TEXT NOT NULL,
++  entity_id TEXT NOT NULL,
++  action TEXT NOT NULL,
++  metadata TEXT NOT NULL DEFAULT '{}',
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
++);
++CREATE INDEX IF NOT EXISTS idx_audit_company ON audit_events(company_id, created_at);
+diff --git a/server/_core/worker-env.ts b/server/_core/worker-env.ts
+index a44aff9..f7d292c 100644
+--- a/server/_core/worker-env.ts
++++ b/server/_core/worker-env.ts
+@@ -1,4 +1,4 @@
+-import type { KVNamespace, R2Bucket } from "@cloudflare/workers-types";
++import type { D1Database, KVNamespace, R2Bucket } from "@cloudflare/workers-types";
+ 
+ /**
+  * Cloudflare Worker environment bindings.
+@@ -14,11 +14,14 @@ import type { KVNamespace, R2Bucket } from "@cloudflare/workers-types";
+ export interface Env {
+   SUPABASE_URL: string;
+   SUPABASE_ANON_KEY: string;
+-  SUPABASE_SERVICE_ROLE_KEY: string;
++  /** Optional. Only needed if the Supabase project still signs tokens with the legacy HS256 secret. */
++  SUPABASE_JWT_SECRET?: string;
+   DATABASE_URL: string;
+   JWT_SECRET: string;
+   OAUTH_SERVER_URL: string;
+   OWNER_OPEN_ID: string;
++  /** Cloudflare D1: the system of record for all fleet data (no Supabase data reads or writes). */
++  DB: D1Database;
+   R2_BUCKET: R2Bucket;
+   KV_CACHE: KVNamespace;
+   ENVIRONMENT: "production" | "development";
+diff --git a/server/_core/worker-r2-delete.ts b/server/_core/worker-r2-delete.ts
+new file mode 100644
+index 0000000..557ad21
+--- /dev/null
++++ b/server/_core/worker-r2-delete.ts
+@@ -0,0 +1,4 @@
++// Retired: photo deletion now lives in server/api/admin.ts (POST /api/v1/admin/photos/delete) and runs against
++// D1 + R2 only. This empty module is kept so older checkouts that still have the file keep type-checking;
++// it is safe to delete.
++export {};
+diff --git a/server/api/admin.ts b/server/api/admin.ts
+new file mode 100644
+index 0000000..9954cb9
+--- /dev/null
++++ b/server/api/admin.ts
+@@ -0,0 +1,277 @@
++import type { Env } from "../_core/worker-env";
++import { requireAdmin, scopedCompanyId, type AdminProfile } from "./auth";
++import { HttpError, json, readJson, str, UUID_RE, type ApiContext } from "./http";
++import { evictPhoto, signPhotoPath } from "./photos";
++
++const TRUCK_STATUSES = ["ready", "inspection_due", "out_of_service"];
++const DEFECT_STATUSES = ["open", "in_progress", "resolved", "waived"];
++
++const placeholders = (n: number) => Array.from({ length: n }, () => "?").join(",");
++const nullable = (v: unknown, max = 200) => str(v, max) || null;
++const dateOrNull = (v: unknown) => {
++  const s = str(v, 10);
++  if (!s) return null;
++  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new HttpError(400, "Dates must look like YYYY-MM-DD.");
++  return s;
++};
++
++/** Runs a write and turns constraint failures into readable messages. */
++async function guarded<T>(fn: () => Promise<T>, messages: { unique?: string; foreign?: string }): Promise<T> {
++  try {
++    return await fn();
++  } catch (error) {
++    const text = error instanceof Error ? error.message : String(error);
++    if (/UNIQUE constraint/i.test(text) && messages.unique) throw new HttpError(409, messages.unique);
++    if (/FOREIGN KEY constraint/i.test(text) && messages.foreign) throw new HttpError(409, messages.foreign);
++    throw error;
++  }
++}
++
++async function ownsCompanyRow(env: Env, profile: AdminProfile, table: "trucks" | "drivers", id: string): Promise<string> {
++  const row = await env.DB.prepare(`SELECT company_id FROM ${table} WHERE id = ?`).bind(id).first<{ company_id: string | null }>();
++  if (!row) throw new HttpError(404, "Record not found.");
++  if (profile.role !== "super_admin" && row.company_id !== profile.company_id) throw new HttpError(403, "That record is outside your company.");
++  return row.company_id ?? "";
++}
++
++export async function handleAdmin({ request, env, url }: ApiContext, segments: string[]): Promise<Response> {
++  const profile = await requireAdmin(request, env);
++  const method = request.method;
++  const [resource, id] = segments;
++  const companyParam = url.searchParams.get("companyId");
++
++  // ---- profile ----------------------------------------------------------------
++  if (resource === "me" && method === "GET") return json(request, profile, 200, { "cache-control": "private, max-age=30" });
++
++  // ---- companies --------------------------------------------------------------
++  if (resource === "companies") {
++    if (method === "GET" && !id) {
++      const rows = profile.role === "super_admin"
++        ? await env.DB.prepare("SELECT id, name, active, photo_retention_days FROM companies ORDER BY name").all()
++        : await env.DB.prepare("SELECT id, name, active, photo_retention_days FROM companies WHERE id = ?").bind(profile.company_id).all();
++      return json(request, rows.results.map((r) => ({ ...r, active: r.active === 1 })));
++    }
++    if (method === "POST" && !id) {
++      if (profile.role !== "super_admin") throw new HttpError(403, "Only a super admin can create companies.");
++      const { name: rawName } = await readJson<{ name?: string }>(request);
++      const name = str(rawName, 120);
++      if (!name) throw new HttpError(400, "Company name is required.");
++      const suffix = () => crypto.randomUUID().slice(0, 4);
++      const slug = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${suffix()}`;
++      const code = `${name.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 8)}-${suffix().toUpperCase()}`;
++      const companyId = crypto.randomUUID();
++      await guarded(
++        () => env.DB.batch([
++          env.DB.prepare("INSERT INTO companies (id, name, slug) VALUES (?, ?, ?)").bind(companyId, name, slug),
++          env.DB.prepare("INSERT INTO company_access_codes (id, company_id, code) VALUES (?, ?, ?)").bind(crypto.randomUUID(), companyId, code),
++          env.DB.prepare("INSERT INTO checklist_templates (id, company_id, version, title, active) VALUES (?, ?, 1, ?, 1)").bind(crypto.randomUUID(), companyId, `${name} checklist v1`),
++        ]),
++        { unique: "A company with that name already exists." }
++      );
++      return json(request, { id: companyId, name, code }, 201);
++    }
++    if (method === "PATCH" && id) {
++      const companyId = scopedCompanyId(profile, id);
++      const body = await readJson<{ photo_retention_days?: number | null }>(request);
++      const days = body.photo_retention_days == null ? null : Math.round(Number(body.photo_retention_days));
++      if (days !== null && (!Number.isFinite(days) || days < 1)) throw new HttpError(400, "Enter a whole number of days, or leave blank to keep photos indefinitely.");
++      await env.DB.prepare("UPDATE companies SET photo_retention_days = ? WHERE id = ?").bind(days, companyId).run();
++      return json(request, { ok: true, photo_retention_days: days });
++    }
++  }
++
++  // ---- trucks -----------------------------------------------------------------
++  if (resource === "trucks") {
++    if (method === "GET" && !id) {
++      const companyId = scopedCompanyId(profile, companyParam);
++      const rows = await env.DB.prepare(
++        `SELECT id, fleet_number, registration, truck_type, model, size, status, license_disc_expiry, roadworthy_expiry, insurance_expiry, next_service_km
++         FROM trucks WHERE company_id = ? ORDER BY fleet_number`
++      ).bind(companyId).all();
++      return json(request, rows.results);
++    }
++    if (method === "POST" && !id) {
++      const b = await readJson<Record<string, unknown>>(request);
++      const companyId = scopedCompanyId(profile, str(b.companyId, 64) || null);
++      const fleet = str(b.fleet_number, 20);
++      const registration = str(b.registration, 20).toUpperCase();
++      if (!fleet || !registration) throw new HttpError(400, "Fleet number and registration are required.");
++      const status = str(b.status, 20) || "ready";
++      if (!TRUCK_STATUSES.includes(status)) throw new HttpError(400, "Invalid status.");
++      const km = b.next_service_km === "" || b.next_service_km == null ? null : Number(b.next_service_km);
++      if (km !== null && (!Number.isInteger(km) || km < 0)) throw new HttpError(400, "Next service km must be a whole number.");
++      const fields = [fleet, registration, nullable(b.truck_type), nullable(b.model), nullable(b.size), status, dateOrNull(b.license_disc_expiry), dateOrNull(b.roadworthy_expiry), dateOrNull(b.insurance_expiry), km];
++      const existingId = str(b.id, 64);
++      const unique = "That fleet number or registration already exists.";
++      if (existingId) {
++        await ownsCompanyRow(env, profile, "trucks", existingId);
++        await guarded(() => env.DB.prepare(
++          `UPDATE trucks SET fleet_number=?, registration=?, truck_type=?, model=?, size=?, status=?, license_disc_expiry=?, roadworthy_expiry=?, insurance_expiry=?, next_service_km=?, updated_at=? WHERE id=?`
++        ).bind(...fields, new Date().toISOString(), existingId).run(), { unique });
++        return json(request, { ok: true, id: existingId });
++      }
++      const newId = crypto.randomUUID();
++      await guarded(() => env.DB.prepare(
++        `INSERT INTO trucks (id, company_id, fleet_number, registration, truck_type, model, size, status, license_disc_expiry, roadworthy_expiry, insurance_expiry, next_service_km) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
++      ).bind(newId, companyId, ...fields).run(), { unique });
++      return json(request, { ok: true, id: newId }, 201);
++    }
++    if (method === "DELETE" && id) {
++      await ownsCompanyRow(env, profile, "trucks", id);
++      await guarded(() => env.DB.prepare("DELETE FROM trucks WHERE id = ?").bind(id).run(), {
++        foreign: "This vehicle has inspection history and can't be deleted. Set it to Out of service instead.",
++      });
++      return json(request, { ok: true });
++    }
++  }
++
++  // ---- admin accounts (public.drivers) ----------------------------------------
++  if (resource === "drivers") {
++    if (method === "GET" && !id) {
++      const companyId = scopedCompanyId(profile, companyParam);
++      const rows = await env.DB.prepare("SELECT id, auth_user_id, employee_number, full_name, phone, role, company_id, active FROM drivers WHERE company_id = ? ORDER BY full_name").bind(companyId).all();
++      return json(request, rows.results.map((r) => ({ ...r, active: r.active === 1 })));
++    }
++    if (method === "POST" && !id) {
++      const b = await readJson<Record<string, unknown>>(request);
++      const companyId = scopedCompanyId(profile, str(b.companyId, 64) || null);
++      const fullName = str(b.full_name, 200);
++      if (!fullName) throw new HttpError(400, "Name is required.");
++      const authUserId = nullable(b.auth_user_id, 64);
++      if (authUserId && !UUID_RE.test(authUserId)) throw new HttpError(400, "The auth user id must be a UUID from Supabase Authentication → Users.");
++      const newId = crypto.randomUUID();
++      await guarded(() => env.DB.prepare(
++        `INSERT INTO drivers (id, auth_user_id, employee_number, full_name, phone, role, active, company_id) VALUES (?, ?, ?, ?, ?, 'admin', 1, ?)`
++      ).bind(newId, authUserId, nullable(b.employee_number, 50), fullName, nullable(b.phone, 40), companyId).run(), { unique: "That login or employee number is already linked to an admin." });
++      return json(request, { ok: true, id: newId }, 201);
++    }
++    if (method === "DELETE" && id) {
++      await ownsCompanyRow(env, profile, "drivers", id);
++      if (id === profile.id) throw new HttpError(400, "You can't remove your own admin access.");
++      await guarded(() => env.DB.prepare("DELETE FROM drivers WHERE id = ?").bind(id).run(), {
++        foreign: "This admin has activity on record and can't be deleted. Ask a super admin to deactivate it instead.",
++      });
++      return json(request, { ok: true });
++    }
++  }
++
++  // ---- daily report: inspections + answers + photos in one call --------------
++  if (resource === "reports" && method === "GET") {
++    const companyId = scopedCompanyId(profile, companyParam);
++    const date = str(url.searchParams.get("date"), 10);
++    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new HttpError(400, "date must look like YYYY-MM-DD.");
++    const inspections = (await env.DB.prepare(
++      `SELECT i.id, i.inspection_date, i.started_at, i.submitted_at, i.status, i.notes, i.driver_name, i.employee_number, i.opening_kilometers, i.shift,
++              t.fleet_number AS t_fleet, t.registration AS t_reg, t.model AS t_model
++       FROM daily_inspections i LEFT JOIN trucks t ON t.id = i.truck_id
++       WHERE i.company_id = ? AND i.inspection_date = ? ORDER BY i.created_at DESC`
++    ).bind(companyId, date).all<Record<string, any>>()).results;
++    if (inspections.length === 0) return json(request, [], 200, { "cache-control": "private, max-age=20" });
++    const ids = inspections.map((r) => r.id);
++    const [answers, photos] = await Promise.all([
++      env.DB.prepare(
++        `SELECT a.inspection_id, a.result, ci.prompt, ci.section_title, ci.sort_order
++         FROM inspection_answers a LEFT JOIN checklist_items ci ON ci.id = a.checklist_item_id WHERE a.inspection_id IN (${placeholders(ids.length)})`
++      ).bind(...ids).all<Record<string, any>>(),
++      env.DB.prepare(`SELECT id, inspection_id, photo_type, storage_path, captured_at FROM inspection_photos WHERE inspection_id IN (${placeholders(ids.length)}) ORDER BY captured_at`).bind(...ids).all<Record<string, any>>(),
++    ]);
++    const signedPhotos: Record<string, any>[] = await Promise.all(photos.results.map(async (p) => ({ ...p, url: `${url.origin}${await signPhotoPath(env, p.storage_path)}` })));
++    const rows = inspections.map((r) => ({
++      id: r.id, inspection_date: r.inspection_date, started_at: r.started_at, submitted_at: r.submitted_at, status: r.status, notes: r.notes,
++      driver_name: r.driver_name, employee_number: r.employee_number, opening_kilometers: r.opening_kilometers, shift: r.shift,
++      truck: r.t_fleet ? { fleet_number: r.t_fleet, registration: r.t_reg, model: r.t_model } : null,
++      answers: answers.results.filter((a) => a.inspection_id === r.id).map((a) => ({
++        result: a.result,
++        checklist_item: a.prompt ? { prompt: a.prompt, section_title: a.section_title, sort_order: a.sort_order } : null,
++      })),
++      photos: signedPhotos.filter((p) => p.inspection_id === r.id).map(({ inspection_id: _omit, ...p }) => p),
++    }));
++    return json(request, rows, 200, { "cache-control": "private, max-age=20" });
++  }
++
++  // ---- defects ----------------------------------------------------------------
++  if (resource === "defects") {
++    if (method === "GET" && !id) {
++      const companyId = scopedCompanyId(profile, companyParam);
++      const rows = (await env.DB.prepare(
++        `SELECT d.id, d.category, d.severity, d.title, d.description, d.status, d.created_at, d.resolved_at,
++                i.inspection_date, i.driver_name, i.company_id, t.fleet_number, t.registration
++         FROM defects d JOIN daily_inspections i ON i.id = d.inspection_id LEFT JOIN trucks t ON t.id = i.truck_id
++         WHERE i.company_id = ? ORDER BY d.created_at DESC`
++      ).bind(companyId).all<Record<string, any>>()).results;
++      return json(request, rows.map((r) => ({
++        id: r.id, category: r.category, severity: r.severity, title: r.title, description: r.description, status: r.status, created_at: r.created_at, resolved_at: r.resolved_at,
++        inspection: { inspection_date: r.inspection_date, driver_name: r.driver_name, company_id: r.company_id, truck: r.fleet_number ? { fleet_number: r.fleet_number, registration: r.registration } : null },
++      })), 200, { "cache-control": "private, max-age=20" });
++    }
++    if (method === "PATCH" && id) {
++      const { status } = await readJson<{ status?: string }>(request);
++      if (!status || !DEFECT_STATUSES.includes(status)) throw new HttpError(400, "Invalid defect status.");
++      const owner = await env.DB.prepare("SELECT i.company_id FROM defects d JOIN daily_inspections i ON i.id = d.inspection_id WHERE d.id = ?").bind(id).first<{ company_id: string }>();
++      if (!owner) throw new HttpError(404, "Defect not found.");
++      scopedCompanyId(profile, owner.company_id);
++      const resolved = status === "resolved";
++      await env.DB.prepare("UPDATE defects SET status = ?, resolved_by = ?, resolved_at = ? WHERE id = ?").bind(status, resolved ? profile.id : null, resolved ? new Date().toISOString() : null, id).run();
++      return json(request, { ok: true });
++    }
++  }
++
++  // ---- audit trail ------------------------------------------------------------
++  if (resource === "audit") {
++    if (method === "GET") {
++      const companyId = scopedCompanyId(profile, companyParam);
++      const rows = await env.DB.prepare("SELECT id, entity_type, entity_id, action, metadata, created_at FROM audit_events WHERE company_id = ? ORDER BY created_at DESC LIMIT 100").bind(companyId).all<Record<string, any>>();
++      return json(request, rows.results.map((r) => ({ ...r, metadata: safeParse(r.metadata) })), 200, { "cache-control": "private, max-age=20" });
++    }
++    if (method === "POST") {
++      const b = await readJson<Record<string, unknown>>(request);
++      const companyId = scopedCompanyId(profile, str(b.companyId, 64) || null);
++      await env.DB.prepare("INSERT INTO audit_events (id, company_id, actor_id, entity_type, entity_id, action, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)")
++        .bind(crypto.randomUUID(), companyId, profile.id, str(b.entity_type, 40), str(b.entity_id, 500), str(b.action, 120), JSON.stringify(b.metadata ?? {}).slice(0, 4000)).run();
++      return json(request, { ok: true }, 201);
++    }
++  }
++
++  // ---- evidence photo library -------------------------------------------------
++  if (resource === "photos") {
++    if (method === "GET") {
++      const companyId = scopedCompanyId(profile, companyParam);
++      const date = str(url.searchParams.get("date"), 10);
++      const fleet = str(url.searchParams.get("fleet"), 20);
++      const inspections = (await env.DB.prepare(
++        `SELECT i.id, i.inspection_date, i.driver_name, t.fleet_number, t.registration FROM daily_inspections i LEFT JOIN trucks t ON t.id = i.truck_id
++         WHERE i.company_id = ?1 AND (?2 = '' OR i.inspection_date = ?2) AND (?3 = '' OR t.fleet_number = ?3) ORDER BY i.inspection_date DESC LIMIT 300`
++      ).bind(companyId, date, fleet).all<Record<string, any>>()).results;
++      if (inspections.length === 0) return json(request, []);
++      const ids = inspections.map((r) => r.id);
++      const photos = (await env.DB.prepare(
++        `SELECT id, inspection_id, photo_type, storage_path, storage_provider, captured_at FROM inspection_photos WHERE inspection_id IN (${placeholders(ids.length)}) ORDER BY captured_at DESC`
++      ).bind(...ids).all<Record<string, any>>()).results;
++      const byId = new Map(inspections.map((r) => [r.id, r]));
++      return json(request, await Promise.all(photos.map(async (p) => {
++        const insp = byId.get(p.inspection_id);
++        return { ...p, url: `${url.origin}${await signPhotoPath(env, p.storage_path)}`, fleet_number: insp?.fleet_number || "Unknown", registration: insp?.registration || "", driver_name: insp?.driver_name || null, inspection_date: insp?.inspection_date || "" };
++      })));
++    }
++    if (method === "POST" && id === "delete") {
++      const { ids } = await readJson<{ ids?: string[] }>(request);
++      const list = (Array.isArray(ids) ? ids : []).map((v) => str(v, 64)).filter(Boolean).slice(0, 100);
++      if (list.length === 0) throw new HttpError(400, "No photos selected.");
++      const rows = (await env.DB.prepare(
++        `SELECT p.id, p.storage_path, i.company_id FROM inspection_photos p JOIN daily_inspections i ON i.id = p.inspection_id WHERE p.id IN (${placeholders(list.length)})`
++      ).bind(...list).all<{ id: string; storage_path: string; company_id: string }>()).results;
++      const allowed = rows.filter((r) => profile.role === "super_admin" || r.company_id === profile.company_id);
++      if (allowed.length !== list.length) throw new HttpError(403, "Some of those photos are outside your company.");
++      await env.R2_BUCKET.delete(allowed.map((r) => r.storage_path));
++      await env.DB.prepare(`DELETE FROM inspection_photos WHERE id IN (${placeholders(allowed.length)})`).bind(...allowed.map((r) => r.id)).run();
++      await Promise.all(allowed.map((r) => evictPhoto(url.origin, r.storage_path)));
++      return json(request, { deleted: allowed.map((r) => r.id) });
++    }
++  }
++
++  throw new HttpError(404, "Not found.");
++}
++
++function safeParse(value: unknown): unknown {
++  try { return typeof value === "string" ? JSON.parse(value) : value; } catch { return {}; }
++}
+diff --git a/server/api/auth.ts b/server/api/auth.ts
+new file mode 100644
+index 0000000..879ee6b
+--- /dev/null
++++ b/server/api/auth.ts
+@@ -0,0 +1,115 @@
++import { createLocalJWKSet, decodeProtectedHeader, jwtVerify, type JSONWebKeySet } from "jose";
++import type { Env } from "../_core/worker-env";
++import { HttpError } from "./http";
++
++export type AdminProfile = {
++  id: string;
++  auth_user_id: string;
++  employee_number: string | null;
++  full_name: string;
++  phone: string | null;
++  role: "admin" | "super_admin";
++  company_id: string | null;
++  active: boolean;
++};
++
++function bearer(request: Request): string | null {
++  const value = request.headers.get("authorization") ?? "";
++  return value.startsWith("Bearer ") ? value.slice(7) : null;
++}
++
++const JWKS_TTL_SECONDS = 3600;
++
++/** The Supabase signing keys are fetched at most once an hour per edge location, then verified locally. */
++async function loadJwks(env: Env, forceRefresh = false): Promise<JSONWebKeySet> {
++  const url = `${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`;
++  const cache = (caches as unknown as { default: Cache }).default;
++  const key = new Request(url);
++  if (!forceRefresh) {
++    const hit = await cache.match(key);
++    if (hit) return (await hit.json()) as JSONWebKeySet;
++  }
++  const fresh = await fetch(url, { headers: { apikey: env.SUPABASE_ANON_KEY } });
++  if (!fresh.ok) throw new HttpError(503, "The sign-in service is temporarily unavailable.");
++  const body = await fresh.text();
++  await cache.put(key, new Response(body, { headers: { "content-type": "application/json", "cache-control": `public, max-age=${JWKS_TTL_SECONDS}` } }));
++  return JSON.parse(body) as JSONWebKeySet;
++}
++
++async function sha256Hex(value: string): Promise<string> {
++  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
++  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
++}
++
++/** Fallback for projects that still sign tokens with the legacy shared secret and no secret is configured here. */
++async function verifyViaAuthServer(token: string, env: Env): Promise<string> {
++  const cacheKey = `jwt:${await sha256Hex(token)}`;
++  const cached = await env.KV_CACHE.get(cacheKey);
++  if (cached) return cached;
++  const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
++    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
++  });
++  if (!response.ok) throw new HttpError(401, "Your session is no longer valid. Please sign in again.");
++  const user = (await response.json()) as { id?: string };
++  if (!user.id) throw new HttpError(401, "Unable to identify the signed-in user.");
++  await env.KV_CACHE.put(cacheKey, user.id, { expirationTtl: 300 });
++  return user.id;
++}
++
++/** Verifies a Supabase access token and returns the auth user id (the `sub` claim). */
++export async function verifyAccessToken(token: string, env: Env): Promise<string> {
++  const issuer = `${env.SUPABASE_URL}/auth/v1`;
++  try {
++    const header = decodeProtectedHeader(token);
++    if (header.alg === "HS256") {
++      if (!env.SUPABASE_JWT_SECRET) return await verifyViaAuthServer(token, env);
++      const { payload } = await jwtVerify(token, new TextEncoder().encode(env.SUPABASE_JWT_SECRET), { issuer, audience: "authenticated" });
++      if (!payload.sub) throw new Error("missing sub");
++      return payload.sub;
++    }
++    const verifyWith = async (refresh: boolean) => {
++      const jwks = createLocalJWKSet(await loadJwks(env, refresh));
++      return jwtVerify(token, jwks, { issuer, audience: "authenticated" });
++    };
++    try {
++      const { payload } = await verifyWith(false);
++      if (!payload.sub) throw new Error("missing sub");
++      return payload.sub;
++    } catch (error) {
++      // A key rotation makes the cached key set stale: refresh once and retry.
++      if ((error as { code?: string }).code !== "ERR_JWKS_NO_MATCHING_KEY") throw error;
++      const { payload } = await verifyWith(true);
++      if (!payload.sub) throw new Error("missing sub");
++      return payload.sub;
++    }
++  } catch (error) {
++    if (error instanceof HttpError) throw error;
++    throw new HttpError(401, "Your session is no longer valid. Please sign in again.");
++  }
++}
++
++/** Authenticates the caller and loads their admin profile from D1. */
++export async function requireAdmin(request: Request, env: Env): Promise<AdminProfile> {
++  const token = bearer(request);
++  if (!token) throw new HttpError(401, "Authentication required.");
++  const userId = await verifyAccessToken(token, env);
++  const row = await env.DB.prepare(
++    "SELECT id, auth_user_id, employee_number, full_name, phone, role, company_id, active FROM drivers WHERE auth_user_id = ?"
++  )
++    .bind(userId)
++    .first<Omit<AdminProfile, "active"> & { active: number }>();
++  if (!row || !row.active) throw new HttpError(403, "Your account is not linked to an active fleet profile.");
++  if (row.role !== "admin" && row.role !== "super_admin") throw new HttpError(403, "Administrator permission required.");
++  return { ...row, active: true };
++}
++
++/** Super admins may act on any company; company admins only on their own. */
++export function scopedCompanyId(profile: AdminProfile, requested: string | null | undefined): string {
++  if (profile.role === "super_admin") {
++    if (!requested) throw new HttpError(400, "companyId is required.");
++    return requested;
++  }
++  if (!profile.company_id) throw new HttpError(403, "Your account is not linked to a company.");
++  if (requested && requested !== profile.company_id) throw new HttpError(403, "That company is outside your account.");
++  return profile.company_id;
++}
+diff --git a/server/api/driver.ts b/server/api/driver.ts
+new file mode 100644
+index 0000000..28aed40
+--- /dev/null
++++ b/server/api/driver.ts
+@@ -0,0 +1,180 @@
++import type { Env } from "../_core/worker-env";
++import { edgeCached, HttpError, json, readJson, str, UUID_RE, type ApiContext } from "./http";
++
++export const PHOTO_TYPES = ["selfie", "front", "rear", "left", "right", "cab", "dashboard"] as const;
++const IMAGE_EXTENSIONS: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
++const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
++const MAX_OBJECTS_PER_INSPECTION = 16;
++const SHIFTS = ["morning", "day", "night"];
++
++type Company = { id: string; name: string };
++
++export async function companyByCode(env: Env, code: string): Promise<Company | null> {
++  if (!code) return null;
++  return env.DB.prepare(
++    `SELECT c.id, c.name FROM companies c JOIN company_access_codes cac ON cac.company_id = c.id
++     WHERE cac.code = ? AND cac.active = 1 AND c.active = 1 LIMIT 1`
++  )
++    .bind(code)
++    .first<Company>();
++}
++
++/**
++ * One call gives a driver's device everything it needs: company, fleet list and checklist.
++ * Cached at the Cloudflare edge for 5 minutes (and in the browser / service worker), so most
++ * requests never reach D1 at all.
++ */
++export async function handleBootstrap({ request, env, ctx, url }: ApiContext): Promise<Response> {
++  const code = str(url.searchParams.get("code"), 100);
++  if (!code) throw new HttpError(400, "Enter your company access code.");
++  return edgeCached(request, ctx, async () => {
++    const company = await companyByCode(env, code);
++    if (!company) return json(request, { error: "That access code was not recognized." }, 404);
++
++    const [trucks, template] = await Promise.all([
++      env.DB.prepare("SELECT fleet_number, registration FROM trucks WHERE company_id = ? ORDER BY fleet_number").bind(company.id).all<{ fleet_number: string; registration: string }>(),
++      env.DB.prepare("SELECT id, version FROM checklist_templates WHERE company_id = ? AND active = 1 ORDER BY version DESC LIMIT 1").bind(company.id).first<{ id: string; version: number }>(),
++    ]);
++    const items = template
++      ? await env.DB.prepare("SELECT id, section_number, section_title, prompt, sort_order, required FROM checklist_items WHERE template_id = ? ORDER BY sort_order")
++          .bind(template.id)
++          .all<{ id: string; section_number: string; section_title: string; prompt: string; sort_order: number; required: number }>()
++      : { results: [] };
++
++    const body = {
++      company: { companyId: company.id, companyName: company.name, code },
++      trucks: trucks.results,
++      checklist: { templateId: template?.id ?? null, items: items.results.map((i) => ({ ...i, required: i.required === 1 })) },
++    };
++    return new Response(JSON.stringify(body), {
++      headers: { "content-type": "application/json", "cache-control": "public, max-age=60, s-maxage=300, stale-while-revalidate=3600" },
++    });
++  });
++}
++
++/**
++ * Raw image upload straight into R2 through the Worker binding (no presigned URLs, no Supabase function).
++ * Idempotent: re-uploading the same photo slot for the same inspection returns the existing object.
++ */
++export async function handlePhotoUpload({ request, env, url }: ApiContext): Promise<Response> {
++  const code = str(url.searchParams.get("code"), 100);
++  const inspectionId = str(url.searchParams.get("inspectionId"), 64);
++  const photoType = str(url.searchParams.get("photoType"), 32);
++  if (!UUID_RE.test(inspectionId)) throw new HttpError(400, "inspectionId must be a valid UUID.");
++  if (!(PHOTO_TYPES as readonly string[]).includes(photoType)) throw new HttpError(400, `photoType must be one of: ${PHOTO_TYPES.join(", ")}.`);
++  const contentType = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
++  const extension = IMAGE_EXTENSIONS[contentType];
++  if (!extension) throw new HttpError(415, "Photos must be JPEG, PNG or WebP images.");
++  const declared = Number(request.headers.get("content-length") ?? 0);
++  if (declared > MAX_PHOTO_BYTES) throw new HttpError(413, "That photo is too large.");
++
++  const company = await companyByCode(env, code);
++  if (!company) throw new HttpError(403, "That access code was not recognized.");
++
++  const existing = await env.R2_BUCKET.list({ prefix: `inspections/${inspectionId}/`, limit: 50 });
++  const already = existing.objects.find((o) => o.key.startsWith(`inspections/${inspectionId}/${photoType}-`));
++  if (already) return json(request, { objectKey: already.key, duplicate: true });
++  if (existing.objects.length >= MAX_OBJECTS_PER_INSPECTION) throw new HttpError(429, "Too many photos for this inspection.");
++
++  const bytes = await request.arrayBuffer();
++  if (bytes.byteLength === 0) throw new HttpError(400, "The photo was empty.");
++  if (bytes.byteLength > MAX_PHOTO_BYTES) throw new HttpError(413, "That photo is too large.");
++
++  const objectKey = `inspections/${inspectionId}/${photoType}-${crypto.randomUUID()}.${extension}`;
++  await env.R2_BUCKET.put(objectKey, bytes, { httpMetadata: { contentType }, customMetadata: { companyId: company.id } });
++  return json(request, { objectKey }, 201);
++}
++
++type SubmitBody = {
++  inspectionId?: string;
++  code?: string;
++  fullName?: string;
++  employeeNumber?: string;
++  fleetNumber?: string;
++  openingKilometers?: number | string | null;
++  shift?: string;
++  checks?: Record<string, boolean>;
++  itemNotes?: Record<string, string>;
++  notes?: string;
++  photos?: { photoType?: string; objectKey?: string }[];
++};
++
++/**
++ * Replaces six separate Supabase calls with one. Everything is written in a single atomic D1 batch,
++ * and the call is idempotent on `inspectionId`, so the offline queue can retry safely.
++ */
++export async function handleSubmitInspection({ request, env }: ApiContext): Promise<Response> {
++  const body = await readJson<SubmitBody>(request);
++  const inspectionId = str(body.inspectionId, 64);
++  const fullName = str(body.fullName, 200);
++  if (!UUID_RE.test(inspectionId)) throw new HttpError(400, "inspectionId must be a valid UUID.");
++  if (!fullName) throw new HttpError(400, "Full names and surnames are required.");
++  const shift = str(body.shift, 20).toLowerCase();
++  if (!SHIFTS.includes(shift)) throw new HttpError(400, "Choose a shift.");
++  const km = body.openingKilometers === "" || body.openingKilometers == null ? null : Number(body.openingKilometers);
++  if (km !== null && (!Number.isInteger(km) || km < 0)) throw new HttpError(400, "Opening kilometres must be a whole number.");
++
++  const company = await companyByCode(env, str(body.code, 100));
++  if (!company) throw new HttpError(403, "No company selected. Please enter your company access code again.");
++
++  const existing = await env.DB.prepare("SELECT company_id FROM daily_inspections WHERE id = ?").bind(inspectionId).first<{ company_id: string }>();
++  if (existing) {
++    if (existing.company_id !== company.id) throw new HttpError(409, "This inspection id is already in use.");
++    return json(request, { ok: true, inspectionId, duplicate: true });
++  }
++
++  const truck = await env.DB.prepare("SELECT id FROM trucks WHERE company_id = ? AND fleet_number = ?").bind(company.id, str(body.fleetNumber, 50)).first<{ id: string }>();
++  if (!truck) throw new HttpError(404, "The selected fleet number was not found for this company.");
++
++  const template = await env.DB.prepare("SELECT id FROM checklist_templates WHERE company_id = ? AND active = 1 ORDER BY version DESC LIMIT 1").bind(company.id).first<{ id: string }>();
++  if (!template) throw new HttpError(409, "No active checklist template exists for this company.");
++  const items = (await env.DB.prepare("SELECT id, prompt FROM checklist_items WHERE template_id = ? ORDER BY sort_order").bind(template.id).all<{ id: string; prompt: string }>()).results;
++  if (items.length === 0) throw new HttpError(409, "This company's checklist has no items configured.");
++  const checks = body.checks ?? {};
++  if (items.some((item) => typeof checks[item.id] !== "boolean")) throw new HttpError(409, "The checklist has changed since you started. Please refresh and try again.");
++
++  // Photos must already be in R2 under this inspection's own folder.
++  const submitted = Array.isArray(body.photos) ? body.photos : [];
++  const byType = new Map<string, string>();
++  for (const photo of submitted) {
++    const type = str(photo.photoType, 32);
++    const key = str(photo.objectKey, 300);
++    if (!(PHOTO_TYPES as readonly string[]).includes(type) || !key.startsWith(`inspections/${inspectionId}/${type}-`)) throw new HttpError(400, "A photo reference was invalid.");
++    byType.set(type, key);
++  }
++  if (!byType.has("selfie")) throw new HttpError(400, "The selfie image is missing. Please capture the selfie again.");
++  const heads = await Promise.all(Array.from(byType.values()).map((key) => env.R2_BUCKET.head(key)));
++  if (heads.some((head) => !head)) throw new HttpError(409, "A photo did not finish uploading. Please try again.");
++
++  const now = new Date().toISOString();
++  const notes = str(body.notes, 2000) || null;
++  const itemNotes = body.itemNotes ?? {};
++  const failed = items.filter((item) => !checks[item.id]);
++
++  const statements = [
++    env.DB.prepare(
++      `INSERT INTO daily_inspections (id, company_id, truck_id, driver_id, checklist_template_id, inspection_date, started_at, submitted_at,
++         status, notes, signature_name, driver_name, employee_number, opening_kilometers, shift, company_access_code, created_at)
++       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?)`
++    ).bind(inspectionId, company.id, truck.id, template.id, now.slice(0, 10), now, now, notes, fullName, fullName, str(body.employeeNumber, 100) || null, km, shift, str(body.code, 100), now),
++    env.DB.prepare(
++      `INSERT INTO inspection_answers (id, inspection_id, checklist_item_id, result, created_at)
++       SELECT json_extract(value,'$[0]'), ?1, json_extract(value,'$[1]'), json_extract(value,'$[2]'), ?2 FROM json_each(?3)`
++    ).bind(inspectionId, now, JSON.stringify(items.map((item) => [crypto.randomUUID(), item.id, checks[item.id] ? "pass" : "fail"]))),
++    env.DB.prepare(
++      `INSERT INTO inspection_photos (id, inspection_id, photo_type, storage_path, storage_provider, captured_at, created_at)
++       SELECT json_extract(value,'$[0]'), ?1, json_extract(value,'$[1]'), json_extract(value,'$[2]'), 'r2', ?2, ?2 FROM json_each(?3)`
++    ).bind(inspectionId, now, JSON.stringify(Array.from(byType.entries()).map(([type, key]) => [crypto.randomUUID(), type, key]))),
++  ];
++  if (failed.length > 0) {
++    statements.push(
++      env.DB.prepare(
++        `INSERT INTO defects (id, inspection_id, category, severity, title, description, status, created_at)
++         SELECT json_extract(value,'$[0]'), ?1, 'checklist', 'medium', json_extract(value,'$[1]'), json_extract(value,'$[2]'), 'open', ?2 FROM json_each(?3)`
++      ).bind(inspectionId, now, JSON.stringify(failed.map((item) => [crypto.randomUUID(), item.prompt || "Failed checklist item", str(itemNotes[item.id], 1000) || null])))
++    );
++  }
++  await env.DB.batch(statements);
++  return json(request, { ok: true, inspectionId }, 201);
++}
++
+diff --git a/server/api/http.ts b/server/api/http.ts
+new file mode 100644
+index 0000000..4ccd0d8
+--- /dev/null
++++ b/server/api/http.ts
+@@ -0,0 +1,106 @@
++import type { Env } from "../_core/worker-env";
++
++/** Error with an HTTP status that the router turns into a JSON response. */
++export class HttpError extends Error {
++  constructor(public status: number, message: string, public extra: Record<string, unknown> = {}) {
++    super(message);
++  }
++}
++
++const STATIC_ORIGINS = [
++  "https://rovaya.co.za",
++  "https://www.rovaya.co.za",
++  "https://rovaya.pages.dev",
++  "https://kamogeloralph-ux.github.io",
++];
++const ORIGIN_PATTERNS = [/^https:\/\/[a-z0-9-]+\.rovaya\.pages\.dev$/, /^http:\/\/localhost:\d+$/];
++
++export function isAllowedOrigin(origin: string | null): boolean {
++  if (!origin) return false;
++  return STATIC_ORIGINS.includes(origin) || ORIGIN_PATTERNS.some((p) => p.test(origin));
++}
++
++export function corsHeaders(request: Request): Record<string, string> {
++  const origin = request.headers.get("origin");
++  const headers: Record<string, string> = {
++    "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
++    "access-control-allow-headers": "authorization, content-type",
++    "access-control-max-age": "86400",
++    vary: "Origin",
++  };
++  if (origin && isAllowedOrigin(origin)) headers["access-control-allow-origin"] = origin;
++  return headers;
++}
++
++/** Returns a copy of `response` with extra headers (responses from the cache are immutable). */
++export function withHeaders(response: Response, extra: Record<string, string>): Response {
++  const copy = new Response(response.body, response);
++  for (const [k, v] of Object.entries(extra)) copy.headers.set(k, v);
++  return copy;
++}
++
++export function json(request: Request, body: unknown, status = 200, extra: Record<string, string> = {}): Response {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { "content-type": "application/json", "cache-control": "no-store", ...corsHeaders(request), ...extra },
++  });
++}
++
++export async function readJson<T = Record<string, unknown>>(request: Request): Promise<T> {
++  try {
++    const body = await request.json();
++    if (!body || typeof body !== "object") throw new Error("not an object");
++    return body as T;
++  } catch {
++    throw new HttpError(400, "Invalid JSON body");
++  }
++}
++
++export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++
++export function str(value: unknown, max = 500): string {
++  return typeof value === "string" ? value.trim().slice(0, max) : "";
++}
++
++/** True when D1 refused the query because the Workers Free daily row limit was hit. */
++export function isD1LimitError(error: unknown): boolean {
++  const message = error instanceof Error ? error.message : String(error);
++  return /exceeded D1's|free tier daily row/i.test(message);
++}
++
++/** Turns any thrown value into a JSON response. Limit errors become a retryable 503 so the app queues the work on the device. */
++export function errorResponse(request: Request, error: unknown): Response {
++  if (error instanceof HttpError) return json(request, { error: error.message, ...error.extra }, error.status);
++  if (isD1LimitError(error)) {
++    return json(
++      request,
++      { error: "The service is busy right now. Your work is saved on this device and will sync automatically.", retryable: true },
++      503,
++      { "retry-after": "900" }
++    );
++  }
++  console.error("[api] unhandled error", error);
++  return json(request, { error: "Something went wrong on the server." }, 500);
++}
++
++/**
++ * Serve GET responses from the Cloudflare edge cache. `produce` must return a response WITHOUT cors headers
++ * (they depend on the caller's origin); they are added on the way out.
++ */
++export async function edgeCached(
++  request: Request,
++  ctx: ExecutionContext,
++  produce: () => Promise<Response>
++): Promise<Response> {
++  const cache = (caches as unknown as { default: Cache }).default;
++  const key = new Request(request.url, { method: "GET" });
++  const hit = await cache.match(key);
++  if (hit) return withHeaders(hit, { ...corsHeaders(request), "x-cache": "HIT" });
++  const fresh = await produce();
++  if (fresh.status === 200) ctx.waitUntil(cache.put(key, fresh.clone()));
++  return withHeaders(fresh, { ...corsHeaders(request), "x-cache": "MISS" });
++}
++
++export type ApiContext = { request: Request; env: Env; ctx: ExecutionContext; url: URL };
++
++export type ExecutionContext = { waitUntil(promise: Promise<unknown>): void; passThroughOnException?(): void };
+diff --git a/server/api/photos.ts b/server/api/photos.ts
+new file mode 100644
+index 0000000..3d7d672
+--- /dev/null
++++ b/server/api/photos.ts
+@@ -0,0 +1,56 @@
++import type { Env } from "../_core/worker-env";
++import { HttpError, withHeaders, type ApiContext } from "./http";
++
++/** Signed links are valid for 6-12 hours and stay identical within a 6 hour bucket, so browsers and the CDN can cache them. */
++const BUCKET_SECONDS = 6 * 3600;
++
++async function hmacKey(env: Env): Promise<CryptoKey> {
++  return crypto.subtle.importKey("raw", new TextEncoder().encode(`rovaya-photo-v1:${env.JWT_SECRET}`), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
++}
++
++const toHex = (buffer: ArrayBuffer) => Array.from(new Uint8Array(buffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
++const fromHex = (hex: string) => new Uint8Array((hex.match(/.{1,2}/g) ?? []).map((byte) => parseInt(byte, 16)));
++
++export async function signPhotoPath(env: Env, key: string): Promise<string> {
++  const exp = (Math.floor(Date.now() / 1000 / BUCKET_SECONDS) + 2) * BUCKET_SECONDS;
++  const signature = await crypto.subtle.sign("HMAC", await hmacKey(env), new TextEncoder().encode(`${key}.${exp}`));
++  const path = key.split("/").map(encodeURIComponent).join("/");
++  return `/api/v1/photo/${path}?e=${exp}&s=${toHex(signature)}`;
++}
++
++/** Streams a photo from R2 after checking its signature. The edge cache is keyed on the path only. */
++export async function handlePhoto({ request, env, ctx, url }: ApiContext): Promise<Response> {
++  const key = decodeURIComponent(url.pathname.replace("/api/v1/photo/", ""));
++  const exp = Number(url.searchParams.get("e"));
++  const sig = url.searchParams.get("s") ?? "";
++  if (!key.startsWith("inspections/") || !Number.isFinite(exp) || exp < Date.now() / 1000 || !/^[0-9a-f]{64}$/.test(sig)) {
++    throw new HttpError(403, "This photo link is invalid or has expired.");
++  }
++  const valid = await crypto.subtle.verify("HMAC", await hmacKey(env), fromHex(sig), new TextEncoder().encode(`${key}.${exp}`));
++  if (!valid) throw new HttpError(403, "This photo link is invalid or has expired.");
++
++  const cache = (caches as unknown as { default: Cache }).default;
++  const cacheKey = new Request(`${url.origin}${url.pathname}`, { method: "GET" });
++  const cors = { "access-control-allow-origin": "*" };
++  const hit = await cache.match(cacheKey);
++  if (hit) return withHeaders(hit, { ...cors, "x-cache": "HIT" });
++
++  const object = await env.R2_BUCKET.get(key);
++  if (!object) throw new HttpError(404, "Photo not found.");
++  const response = new Response(object.body as unknown as BodyInit, {
++    headers: {
++      "content-type": object.httpMetadata?.contentType ?? "image/jpeg",
++      "cache-control": "public, max-age=86400",
++      etag: object.httpEtag,
++    },
++  });
++  ctx.waitUntil(cache.put(cacheKey, response.clone()));
++  return withHeaders(response, { ...cors, "x-cache": "MISS" });
++}
++
++/** Drop the cached copy of a deleted photo from this edge location. */
++export async function evictPhoto(origin: string, key: string): Promise<void> {
++  const cache = (caches as unknown as { default: Cache }).default;
++  const path = key.split("/").map(encodeURIComponent).join("/");
++  await cache.delete(new Request(`${origin}/api/v1/photo/${path}`, { method: "GET" }));
++}
+diff --git a/server/api/retention.ts b/server/api/retention.ts
+new file mode 100644
+index 0000000..45a2843
+--- /dev/null
++++ b/server/api/retention.ts
+@@ -0,0 +1,47 @@
++import type { Env } from "../_core/worker-env";
++
++const DEFAULT_RETENTION_DAYS = 30;
++const ORPHAN_GRACE_MS = 3 * 24 * 3600 * 1000;
++const placeholders = (n: number) => Array.from({ length: n }, () => "?").join(",");
++
++/**
++ * Nightly job (Cloudflare Cron Trigger) that replaces the two Supabase pg_cron jobs.
++ * Unlike those, it deletes the R2 objects too, so storage no longer fills up with orphaned files.
++ *  1. Delete photos older than the company's retention setting (30 days when unset).
++ *  2. Sweep R2 objects that no database row points to (failed or abandoned uploads), after a 3 day grace period.
++ */
++export async function runRetention(env: Env): Promise<{ expired: number; orphans: number }> {
++  let expired = 0;
++  for (let round = 0; round < 10; round++) {
++    const rows = (await env.DB.prepare(
++      `SELECT p.id, p.storage_path FROM inspection_photos p
++       JOIN daily_inspections i ON i.id = p.inspection_id JOIN companies c ON c.id = i.company_id
++       WHERE p.captured_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || COALESCE(c.photo_retention_days, ${DEFAULT_RETENTION_DAYS}) || ' days')
++       LIMIT 100`
++    ).all<{ id: string; storage_path: string }>()).results;
++    if (rows.length === 0) break;
++    await env.R2_BUCKET.delete(rows.map((r) => r.storage_path));
++    await env.DB.prepare(`DELETE FROM inspection_photos WHERE id IN (${placeholders(rows.length)})`).bind(...rows.map((r) => r.id)).run();
++    expired += rows.length;
++  }
++
++  // Orphan sweep: look at one page of the bucket per run, remembering where we stopped.
++  let orphans = 0;
++  const cursor = (await env.KV_CACHE.get("retention:cursor")) ?? undefined;
++  const page = await env.R2_BUCKET.list({ prefix: "inspections/", limit: 200, cursor });
++  const old = page.objects.filter((o) => Date.now() - new Date(o.uploaded).getTime() > ORPHAN_GRACE_MS);
++  if (old.length > 0) {
++    const known = new Set<string>();
++    for (let i = 0; i < old.length; i += 50) {
++      const chunk = old.slice(i, i + 50).map((o) => o.key);
++      const found = await env.DB.prepare(`SELECT storage_path FROM inspection_photos WHERE storage_path IN (${placeholders(chunk.length)})`).bind(...chunk).all<{ storage_path: string }>();
++      found.results.forEach((r) => known.add(r.storage_path));
++    }
++    const doomed = old.filter((o) => !known.has(o.key)).map((o) => o.key);
++    if (doomed.length > 0) await env.R2_BUCKET.delete(doomed);
++    orphans = doomed.length;
++  }
++  if (page.truncated && page.cursor) await env.KV_CACHE.put("retention:cursor", page.cursor);
++  else await env.KV_CACHE.delete("retention:cursor");
++  return { expired, orphans };
++}
+diff --git a/server/api/router.ts b/server/api/router.ts
+new file mode 100644
+index 0000000..5304fb0
+--- /dev/null
++++ b/server/api/router.ts
+@@ -0,0 +1,29 @@
++import type { Env } from "../_core/worker-env";
++import { handleAdmin } from "./admin";
++import { handleBootstrap, handlePhotoUpload, handleSubmitInspection } from "./driver";
++import { corsHeaders, errorResponse, HttpError, json, type ApiContext, type ExecutionContext } from "./http";
++import { handlePhoto } from "./photos";
++
++/** Everything under /api/v1. Returns null for paths it does not own. */
++export async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response | null> {
++  const url = new URL(request.url);
++  if (!url.pathname.startsWith("/api/v1/")) return null;
++  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
++
++  const api: ApiContext = { request, env, ctx, url };
++  const path = url.pathname.slice("/api/v1/".length).replace(/\/+$/, "");
++  try {
++    if (path === "health") {
++      const row = await env.DB.prepare("SELECT 1 AS ok").first<{ ok: number }>();
++      return json(request, { ok: row?.ok === 1, time: new Date().toISOString() });
++    }
++    if (path.startsWith("photo/") && request.method === "GET") return await handlePhoto(api);
++    if (path === "driver/bootstrap" && request.method === "GET") return await handleBootstrap(api);
++    if (path === "driver/photo" && request.method === "POST") return await handlePhotoUpload(api);
++    if (path === "driver/inspections" && request.method === "POST") return await handleSubmitInspection(api);
++    if (path.startsWith("admin/")) return await handleAdmin(api, path.slice("admin/".length).split("/").map(decodeURIComponent));
++    throw new HttpError(404, "Not found.");
++  } catch (error) {
++    return errorResponse(request, error);
++  }
++}
+diff --git a/src/worker.ts b/src/worker.ts
+index e0273e2..7efed63 100644
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -3,7 +3,8 @@ import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+ import { appRouter } from "../server/routers";
+ import { createWorkerContext } from "../server/_core/worker-context";
+ import { handleStorageProxy } from "../server/_core/worker-storage-proxy";
+-import { handleR2PhotoDelete } from "../server/_core/worker-r2-delete";
++import { handleApi } from "../server/api/router";
++import { runRetention } from "../server/api/retention";
+ import type { Env } from "../server/_core/worker-env";
+ 
+ export type { Env };
+@@ -16,6 +17,11 @@ export default {
+   ): Promise<Response> {
+     const url = new URL(request.url);
+ 
++    // Rovaya REST API: D1 + R2, fronted by the Cloudflare edge cache. Supabase is only
++    // contacted for sign-in (token issue/refresh) - never for data.
++    const apiResponse = await handleApi(request, env, ctx);
++    if (apiResponse) return apiResponse;
++
+     // Handle tRPC API requests
+     if (url.pathname.startsWith("/api/trpc")) {
+       // Captured by createContext, then read back in responseMeta so
+@@ -59,15 +65,13 @@ export default {
+       return handleStorageProxy(request, env);
+     }
+ 
+-    // Admin-only R2 photo deletion. The endpoint validates the Supabase
+-    // session and company scope before deleting both the R2 object and row.
+-    if (url.pathname === "/api/r2/photo/delete") {
+-      return handleR2PhotoDelete(request, env);
+-    }
+-
+     // Default 404
+     return new Response("Not Found", { status: 404 });
+   },
++  // Nightly cleanup (see [triggers] in wrangler.toml): expired photos + orphaned R2 uploads.
++  async scheduled(_event: unknown, env: Env, ctx: ExecutionContext): Promise<void> {
++    ctx.waitUntil(runRetention(env).then((result) => console.log("[retention]", JSON.stringify(result))));
++  },
+ // `satisfies ExportedHandler<Env>` would fail here: ExportedHandler's own
+ // signature expects @cloudflare/workers-types' Request/Response, but this
+ // file deliberately uses lib.dom's (same objects at the real Workers
+diff --git a/wrangler.toml b/wrangler.toml
+index a1059de..f2aa0ff 100644
+--- a/wrangler.toml
++++ b/wrangler.toml
+@@ -18,6 +18,17 @@ jurisdiction = "eu"
+ binding = "KV_CACHE"
+ id = "75d081729b674717944940f65bb7c7a0"
+ 
++# D1 database: system of record for trucks, checklists, inspections, defects and audit events.
++[[d1_databases]]
++binding = "DB"
++database_name = "rovaya-d1"
++database_id = "7f611511-8ba6-412e-837b-429241d9cb21"
++migrations_dir = "migrations"
++
++# Nightly photo retention + orphan sweep (replaces the Supabase pg_cron jobs). 01:00 UTC = 03:00 SAST.
++[triggers]
++crons = ["0 1 * * *"]
++
+ [observability]
+ enabled = true
+ 
