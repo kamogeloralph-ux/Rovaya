@@ -18,6 +18,17 @@ jurisdiction = "eu"
 binding = "KV_CACHE"
 id = "75d081729b674717944940f65bb7c7a0"
 
+# D1 database: system of record for trucks, checklists, inspections, defects and audit events.
+[[d1_databases]]
+binding = "DB"
+database_name = "rovaya-d1"
+database_id = "7f611511-8ba6-412e-837b-429241d9cb21"
+migrations_dir = "migrations"
+
+# Nightly photo retention + orphan sweep (replaces the Supabase pg_cron jobs). 01:00 UTC = 03:00 SAST.
+[triggers]
+crons = ["0 1 * * *"]
+
 [observability]
 enabled = true
 
